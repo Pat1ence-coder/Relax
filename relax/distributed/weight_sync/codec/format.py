@@ -99,6 +99,14 @@ class ChunkDescriptor:
             raise DeltaCodecError("chunk metadata exceeds limit")
         return data
 
+    @classmethod
+    def from_metadata_bytes(cls, data: bytes, limits: CodecLimits = CodecLimits()) -> "ChunkDescriptor":
+        """Parse a descriptor independently of its payload, for paged
+        indexes."""
+        if type(data) is not bytes or len(data) > limits.max_metadata_bytes:
+            raise DeltaCodecError("chunk metadata exceeds limit or is not bytes")
+        return _parse_metadata(data, limits)
+
 
 def _exact_keys(value: Any, keys: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
