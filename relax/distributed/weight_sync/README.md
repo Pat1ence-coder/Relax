@@ -9,6 +9,12 @@ Explicit [POSIX shared-storage adapters](storage/README.md) add immutable
 artifact files, a local WAL publication authority, sealed offline archives,
 and disk-backed reconstruction without coupling storage to the codec.
 
+Storage readers/writers have public contracts independent of POSIX paths.
+Explicit deployment APIs check namespace, mount placement, access roles and
+declared volume budgets before configured access. Their diagnostic reports
+distinguish configuration admission from unperformed compatibility tests; see
+the storage README for the low-level API boundary and recovery ordering.
+
 ## Contract
 
 The exporter supplies immutable `bytes` in little-endian, C-contiguous logical

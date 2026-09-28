@@ -5,40 +5,25 @@ import os
 import re
 import stat
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 
 from ..codec import EncodedChunk
 from ..codec.format import content_hash
-from ..integrity import ModelRoot
 from ..limits import DeltaCodecError, SnapshotLimits, require_uint
 from ..manifest import ChunkRecord, IndexPage, Manifest, PageRef
 from ..schema import require_digest
-from .files import child_directory, exclusive_lock, install_file, open_directory, read_file
+from .contracts import ObjectReceipt, StorageLimits, StoreCapabilities
+from .deployment import PROFILE, DeploymentAdmission, DeploymentReport
+from .files import ARTIFACT_DIRECTORIES, child_directory, exclusive_lock, install_file, open_directory, read_file
+from .placement import DirectoryGuard, StorageDeploymentError, require_separate
+from .repository import read_manifest, validate_artifacts, write_manifest
 
 
 _KEY = re.compile(
-    r"(?:chunks/[0-9a-f]{64}|(?:indexes|manifests|archives)/[0-9a-f]{64}\.json|catalog/[0-9]{20}-[0-9a-f]{64}\.json|authority\.json)"
+    r"(?:chunks/[0-9a-f]{64}|(?:indexes|manifests|archives)/[0-9a-f]{64}\.json|catalog/[0-9]{20}-[0-9a-f]{64}\.json|(?:authority|namespace)\.json)"
 )
-_DIRECTORIES = ("chunks", "indexes", "manifests", "catalog", "archives")
+_DIRECTORIES = ARTIFACT_DIRECTORIES
 _TEMP = re.compile(r"\.tmp-[0-9a-f]{32}")
-
-
-@dataclass(frozen=True)
-class StorageLimits:
-    max_bytes: int = 1 << 40
-    max_objects: int = 1 << 20
-    max_records: int = 4096
-    max_record_bytes: int = 16 * 1024
-    max_archive_bytes: int = 1024 * 1024
-    max_chain_depth: int = 128
-    max_database_bytes: int = 64 * 1024 * 1024
-
-    def __post_init__(self) -> None:
-        for name in self.__dataclass_fields__:
-            require_uint(getattr(self, name), name)
-            if getattr(self, name) == 0:
-                raise DeltaCodecError("storage limits must be positive")
 
 
 class PosixArtifactStore:
@@ -58,10 +43,13 @@ class PosixArtifactStore:
         writable: bool = False,
         limits: SnapshotLimits = SnapshotLimits(),
         storage_limits: StorageLimits = StorageLimits(),
+        _admission: DeploymentAdmission | None = None,
     ) -> None:
         self.limits, self.storage_limits = limits, storage_limits
         self.root = Path(root).absolute()
-        self._fd = open_directory(self.root, create=writable)
+        self._admission = _admission
+        self._recovering = writable and _admission is not None
+        self._fd = open_directory(self.root, create=writable and _admission is None)
         self._lock: int | None = None
         self._owner = (os.getpid(), threading.get_ident())
         self._poisoned = False
@@ -69,12 +57,39 @@ class PosixArtifactStore:
         self._directories: dict[str, int] = {}
         self._bytes = self._objects = 0
         try:
+            if _admission is not None:
+                if writable != (_admission.config.access == "publisher"):
+                    raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "store_role_mismatch")
+                _admission.report.require_admitted()
+                _admission.validate_artifact(self._fd)
             if writable:
                 self._lock = exclusive_lock(self._fd, ".writer.lock")
+                if _admission is not None:
+                    _admission.validate_artifact(self._fd)
             for name in _DIRECTORIES:
-                self._directories[name] = child_directory(self._fd, name, create=writable)
+                policy = None if _admission is None else _admission.config.access_policy
+                descriptor = child_directory(
+                    self._fd,
+                    name,
+                    create=writable,
+                    mode=0o700 if policy is None else policy.directory_mode,
+                    group_id=None if policy is None else policy.shared_group_id,
+                )
+                self._directories[name] = descriptor
+                if _admission is not None:
+                    _admission.artifact_guard.validate_child_mount(descriptor)
+                if policy is not None:
+                    info = os.fstat(descriptor)
+                    if info.st_mode & 0o022:
+                        raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "artifact_directory_write_policy")
+                    if policy.shared_group_id is not None and (
+                        info.st_gid != policy.shared_group_id or info.st_mode & 0o050 != 0o050
+                    ):
+                        raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "artifact_directory_group_policy")
             if writable:
                 self._inventory(clean_temporaries=True)
+                if _admission is not None and _admission.initializing:
+                    self.put_object("namespace.json", _admission.config.namespace.to_bytes())
         except BaseException:
             self.close()
             raise
@@ -86,6 +101,8 @@ class PosixArtifactStore:
         self.close()
 
     def close(self) -> None:
+        if self._lock is not None and self._owner != (os.getpid(), threading.get_ident()):
+            raise DeltaCodecError("artifact writer close requires the owning process and thread")
         for fd in self._directories.values():
             os.close(fd)
         self._directories.clear()
@@ -95,6 +112,69 @@ class PosixArtifactStore:
         if self._fd >= 0:
             os.close(self._fd)
             self._fd = -1
+
+    @property
+    def deployment_report(self) -> DeploymentReport | None:
+        return None if self._admission is None else self._admission.report
+
+    def capabilities(self) -> StoreCapabilities:
+        if self._fd < 0:
+            raise DeltaCodecError("artifact store is closed")
+        requirements = ("atomic_hard_link", "advisory_writer_lock", "file_fsync", "directory_fsync")
+        if self._admission is not None and self._admission.config.access_policy.shared_group_id is not None:
+            requirements += ("atomic_directory_noreplace",)
+        return StoreCapabilities(
+            backend="posix",
+            profile=PROFILE,
+            access="reader" if self._lock is None else "publisher",
+            namespace_id=None if self._admission is None else self._admission.config.namespace.namespace_id,
+            requirements=requirements,
+            deployment_checked=self._admission is not None,
+            stream_id=None if self._admission is None else self._admission.config.namespace.stream_id,
+            run_epoch=None if self._admission is None else self._admission.config.namespace.run_epoch,
+        )
+
+    def prepare_control(self, location: Path) -> DirectoryGuard:
+        self._require_writer()
+        require_separate(self.root, location)
+        if self._admission is not None:
+            return self._admission.prepare_control(location)
+        return DirectoryGuard.capture(location, must_exist=False)
+
+    def begin_recovery(self) -> None:
+        self._require_writer()
+        self._recovering = True
+
+    def finish_recovery(self) -> None:
+        self._require_writer()
+        if self._reservations:
+            raise DeltaCodecError("pending publication reservations prevent new uploads")
+        self._recovering = False
+
+    def _require_writer(self) -> None:
+        if self._fd < 0:
+            raise DeltaCodecError("artifact store is closed")
+        if self._lock is None:
+            raise DeltaCodecError("artifact store is read-only")
+        if self._owner != (os.getpid(), threading.get_ident()):
+            raise DeltaCodecError("artifact writes require the owning process and thread")
+        if self._poisoned:
+            raise DeltaCodecError("artifact inventory is uncertain; close and reopen the writer")
+
+    def put_immutable(self, key: str, data: bytes, *, expected_hash: str) -> ObjectReceipt:
+        require_digest(expected_hash, "object hash")
+        if type(data) is not bytes or content_hash(data) != expected_hash:
+            raise DeltaCodecError("immutable write differs from expected hash")
+        self.put_object(key, data)
+        capabilities = self.capabilities()
+        return ObjectReceipt(
+            key,
+            expected_hash,
+            len(data),
+            capabilities.namespace_id,
+            capabilities.profile,
+            None if self._admission is None else self._admission.config.required_fault_domain,
+        )
 
     def _location(self, key: str) -> tuple[int, str]:
         if self._fd < 0:
@@ -141,17 +221,18 @@ class PosixArtifactStore:
             "archives": self.storage_limits.max_archive_bytes,
             "catalog": self.storage_limits.max_record_bytes,
             "authority.json": self.storage_limits.max_record_bytes,
+            "namespace.json": self.storage_limits.max_record_bytes,
         }[key.split("/")[0]]
 
     def ensure_capacity(self, key: str, data: bytes) -> bool:
         """Preflight under the single synchronous writer; return whether
         new."""
-        if self._lock is None:
-            raise DeltaCodecError("artifact store is read-only")
-        if self._owner != (os.getpid(), threading.get_ident()):
-            raise DeltaCodecError("artifact writes require the owning process and thread")
-        if self._poisoned:
-            raise DeltaCodecError("artifact inventory is uncertain; close and reopen the writer")
+        self._require_writer()
+        if self._recovering and not (key.startswith("catalog/") or key in ("authority.json", "namespace.json")):
+            raise DeltaCodecError("publication recovery must finish before new artifact uploads")
+        if key == "namespace.json" and self._admission is not None:
+            if data != self._admission.config.namespace.to_bytes():
+                raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_write_conflict")
         if type(data) is not bytes:
             raise DeltaCodecError("artifact must be immutable bytes")
         directory, name = self._location(key)
@@ -185,6 +266,7 @@ class PosixArtifactStore:
             self._reservations[key] = (len(data), content_hash(data))
 
     def release_record(self, key: str) -> None:
+        self._require_writer()
         self._reservations.pop(key, None)
 
     def put_object(self, key: str, data: bytes) -> None:
@@ -195,7 +277,11 @@ class PosixArtifactStore:
             self.release_record(key)
             return
         try:
-            install_file(directory, name, data)
+            if self._admission is None:
+                install_file(directory, name, data)
+            else:
+                policy = self._admission.config.access_policy
+                install_file(directory, name, data, mode=policy.object_mode, group_id=policy.shared_group_id)
         except BaseException as error:
             try:
                 self._inventory(clean_temporaries=True)
@@ -236,39 +322,15 @@ class PosixArtifactStore:
         return data
 
     def read_manifest(self, manifest_id: str) -> Manifest:
-        require_digest(manifest_id, "manifest_id")
-        data = self.read_object(f"manifests/{manifest_id}.json", self.limits.max_manifest_bytes)
-        return Manifest.from_bytes(data, expected_manifest_id=manifest_id, limits=self.limits)
+        return read_manifest(self, manifest_id)
 
     def validate_artifacts(self, manifest: Manifest) -> None:
         """Check coverage and stored hashes; consumers still verify decoded
         roots."""
-        manifest.validate(self.limits)
-        specs = iter(manifest.schema.iter_chunks())
-        root = ModelRoot(manifest.schema.schema_id, manifest.schema.directory_hash)
-        for ref in manifest.pages:
-            page = IndexPage.from_bytes(self.read_index(ref), ref, self.limits)
-            for record in page.records:
-                descriptor = record.descriptor
-                if descriptor.spec != next(specs, None) or descriptor.target_version != manifest.target.version:
-                    raise DeltaCodecError("artifact chunk coverage or version mismatch")
-                if descriptor.base_version is not None and (
-                    manifest.base is None or descriptor.base_version != manifest.base.version
-                ):
-                    raise DeltaCodecError("artifact base version mismatch")
-                payload = self.read_payload(record)
-                if descriptor.base_version is None and content_hash(payload) != descriptor.target_hash:
-                    raise DeltaCodecError("RAW target hash mismatch")
-                root.add(descriptor.spec, descriptor.target_hash)
-        if next(specs, None) is not None or root.hexdigest() != manifest.target.target_root:
-            raise DeltaCodecError("artifact directory root mismatch")
+        validate_artifacts(self, manifest)
 
     def write_manifest(self, manifest: Manifest) -> str:
-        self.validate_artifacts(manifest)
-        data = manifest.to_bytes(self.limits)
-        manifest_id = content_hash(data)
-        self.put_object(f"manifests/{manifest_id}.json", data)
-        return manifest_id
+        return write_manifest(self, manifest)
 
     def catalog_keys(self) -> list[str]:
         result = []

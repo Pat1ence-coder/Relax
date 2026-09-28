@@ -9,11 +9,12 @@ from ..limits import DeltaCodecError, require_uint
 from ..manifest import Manifest
 from ..schema import require_digest
 from ..serialization import canonical_json, exact_fields, parse_json, require_identifier
-from .artifacts import PosixArtifactStore
 from .catalog import Publication
+from .contracts import StorageReader, StorageWriter
+from .repository import validate_artifacts
 
 
-def _load_record(store: PosixArtifactStore, key: str, expected_hash: str | None = None) -> Publication:
+def _load_record(store: StorageReader, key: str, expected_hash: str | None = None) -> Publication:
     data = store.read_object(key, store.storage_limits.max_record_bytes)
     if expected_hash is not None:
         require_digest(expected_hash, "record hash")
@@ -26,7 +27,7 @@ def _load_record(store: PosixArtifactStore, key: str, expected_hash: str | None 
 
 
 def _check_closure(
-    store: PosixArtifactStore,
+    store: StorageReader,
     records: tuple[Publication, ...],
     requested: tuple[str, ...],
     authority_id: str,
@@ -57,7 +58,7 @@ def _check_closure(
         else:
             depth = 0
         require_uint(depth, "archive chain depth", store.storage_limits.max_chain_depth)
-        store.validate_artifacts(manifest)
+        validate_artifacts(store, manifest)
         by_id[record.manifest_id] = record
         depths[record.manifest_id] = depth
     if not requested or len(set(requested)) != len(requested) or any(mid not in by_id for mid in requested):
@@ -81,10 +82,16 @@ class OfflineCatalog:
     requested version must be explicitly present; absent versions are errors.
     """
 
-    def __init__(self, store: PosixArtifactStore, *, stream_id: str, run_epoch: str) -> None:
+    def __init__(self, store: StorageReader, *, stream_id: str, run_epoch: str) -> None:
         self.store = store
         require_identifier(stream_id, "stream_id")
         require_identifier(run_epoch, "run_epoch")
+        capabilities = store.capabilities()
+        if capabilities.stream_id is not None and (capabilities.stream_id, capabilities.run_epoch) != (
+            stream_id,
+            run_epoch,
+        ):
+            raise DeltaCodecError("archive differs from deployment namespace")
         value = exact_fields(
             parse_json(
                 store.read_object("authority.json", store.storage_limits.max_record_bytes),
@@ -116,9 +123,17 @@ class OfflineCatalog:
             result.append(record)
         return tuple(result)
 
-    def seal_archive(self, versions: tuple[int, ...], *, prefer_full: bool = True) -> str:
+    def seal_archive(
+        self, versions: tuple[int, ...], *, prefer_full: bool = True, writer: StorageWriter | None = None
+    ) -> str:
         """Persist the exact requested set plus transitive anchor
         dependencies."""
+        if writer is None:
+            if not isinstance(self.store, StorageWriter) or self.store.capabilities().access != "publisher":
+                raise DeltaCodecError("archive sealing requires an explicit publisher writer")
+            writer = self.store
+        if writer.capabilities().access != "publisher":
+            raise DeltaCodecError("archive sealing requires a publisher writer")
         if not isinstance(versions, tuple) or not versions or len(versions) > self.store.storage_limits.max_records:
             raise DeltaCodecError("invalid archive version count")
         for version in versions:
@@ -162,7 +177,16 @@ class OfflineCatalog:
         }
         data = canonical_json(value, self.store.storage_limits.max_archive_bytes)
         archive_id = content_hash(data)
-        self.store.put_object(f"archives/{archive_id}.json", data)
+        if writer is not self.store:
+            if writer.capabilities().namespace_id != self.store.capabilities().namespace_id:
+                raise DeltaCodecError("archive writer belongs to a different namespace")
+            source_binding = self.store.read_object("authority.json", self.store.storage_limits.max_record_bytes)
+            if writer.read_object("authority.json", writer.storage_limits.max_record_bytes) != source_binding:
+                raise DeltaCodecError("archive writer belongs to a different authority")
+            for record in ordered:
+                _load_record(writer, record.key, content_hash(record.to_bytes(self.store.storage_limits)))
+            _check_closure(writer, ordered, tuple(requested), self.authority_id, self.stream_id, self.run_epoch)
+        writer.put_immutable(f"archives/{archive_id}.json", data, expected_hash=archive_id)
         return archive_id
 
 
@@ -172,7 +196,7 @@ class OfflineArchive:
     requested: tuple[str, ...]
 
     @classmethod
-    def open(cls, store: PosixArtifactStore, *, expected_archive_id: str) -> "OfflineArchive":
+    def open(cls, store: StorageReader, *, expected_archive_id: str) -> "OfflineArchive":
         require_digest(expected_archive_id, "archive_id")
         data = store.read_object(f"archives/{expected_archive_id}.json", store.storage_limits.max_archive_bytes)
         if content_hash(data) != expected_archive_id:
@@ -200,6 +224,6 @@ class OfflineArchive:
         )
         return result
 
-    def manifests(self, store: PosixArtifactStore) -> Iterator[tuple[Publication, Manifest]]:
+    def manifests(self, store: StorageReader) -> Iterator[tuple[Publication, Manifest]]:
         for record in self.records:
             yield record, record.load_manifest(store)

@@ -9,12 +9,14 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from ..codec.format import content_hash
 from ..limits import DeltaCodecError, require_uint
 from ..manifest import Manifest, SnapshotIdentity
 from ..schema import require_digest
 from ..serialization import canonical_json, exact_fields, parse_json, require_identifier
-from .artifacts import PosixArtifactStore, StorageLimits
+from .contracts import StorageLimits, StorageReader, StorageWriter
 from .files import exclusive_lock, open_directory
+from .repository import read_manifest, write_manifest
 
 
 class PublicationUncertain(DeltaCodecError):
@@ -82,8 +84,8 @@ class Publication:
             raise DeltaCodecError("noncanonical publication")
         return result
 
-    def load_manifest(self, store: PosixArtifactStore) -> Manifest:
-        manifest = store.read_manifest(self.manifest_id)
+    def load_manifest(self, store: StorageReader) -> Manifest:
+        manifest = read_manifest(store, self.manifest_id)
         if (manifest.target, manifest.kind, manifest.writer_fence) != (self.target, self.kind, self.writer_fence):
             raise DeltaCodecError("publication differs from manifest")
         return manifest
@@ -98,9 +100,7 @@ class ProducerCatalog:
     of unsafe GC.
     """
 
-    def __init__(
-        self, local_control_dir: str | Path, store: PosixArtifactStore, *, stream_id: str, run_epoch: str
-    ) -> None:
+    def __init__(self, local_control_dir: str | Path, store: StorageWriter, *, stream_id: str, run_epoch: str) -> None:
         require_identifier(stream_id, "stream_id")
         require_identifier(run_epoch, "run_epoch")
         self.store, self.stream_id, self.run_epoch = store, stream_id, run_epoch
@@ -109,13 +109,20 @@ class ProducerCatalog:
         self._lock: int | None = None
         self._db: sqlite3.Connection | None = None
         control = Path(local_control_dir).absolute()
-        if control.resolve().is_relative_to(store.root.resolve()) or store.root.resolve().is_relative_to(
-            control.resolve()
+        capabilities = store.capabilities()
+        if capabilities.access != "publisher":
+            raise DeltaCodecError("producer catalog requires a publisher store")
+        if capabilities.stream_id is not None and (capabilities.stream_id, capabilities.run_epoch) != (
+            stream_id,
+            run_epoch,
         ):
-            raise DeltaCodecError("control directory and shared artifacts must be separate")
+            raise DeltaCodecError("publication differs from deployment namespace")
+        control_guard = store.prepare_control(control)
         try:
             self._fd = open_directory(control, create=True)
+            control_guard.validate_opened(self._fd)
             self._lock = exclusive_lock(self._fd, ".authority.lock")
+            store.begin_recovery()
             for name in ("catalog.sqlite3", "catalog.sqlite3-wal", "catalog.sqlite3-shm"):
                 try:
                     info = os.stat(name, dir_fd=self._fd, follow_symlinks=False)
@@ -124,6 +131,7 @@ class ProducerCatalog:
                 if not stat.S_ISREG(info.st_mode):
                     raise DeltaCodecError("control database must use regular files")
             self._db = sqlite3.connect(control / "catalog.sqlite3", isolation_level=None, timeout=0)
+            control_guard.validate_opened(self._fd)
             if self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
                 raise DeltaCodecError("SQLite WAL is required")
             self._db.execute("PRAGMA synchronous=FULL")
@@ -157,8 +165,9 @@ class ProducerCatalog:
             )
             self._checkpoint()
             os.fsync(self._fd)
-            store.put_object("authority.json", binding)
+            store.put_immutable("authority.json", binding, expected_hash=content_hash(binding))
             self.export_pending()
+            store.finish_recovery()
         except BaseException:
             self.close()
             raise
@@ -227,7 +236,8 @@ class ProducerCatalog:
         return Publication.from_bytes(row[0], self.limits), row[1]
 
     def _export(self, record: Publication) -> None:
-        self.store.put_object(record.key, record.to_bytes(self.limits))
+        data = record.to_bytes(self.limits)
+        self.store.put_immutable(record.key, data, expected_hash=content_hash(data))
 
     def export_pending(self) -> None:
         # No mutable exported flag: idempotent re-export also repairs a missing
@@ -265,7 +275,7 @@ class ProducerCatalog:
         self._checkpoint()
         # Data durability precedes the authority decision; failures can leave
         # immutable orphans, retained within the store quota for explicit GC.
-        self.store.write_manifest(manifest)
+        write_manifest(self.store, manifest)
         db.execute("BEGIN IMMEDIATE")
         reserved_key = None
         try:
