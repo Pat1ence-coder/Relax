@@ -16,6 +16,7 @@ from ..schema import require_digest
 from ..serialization import canonical_json, exact_fields, parse_json, require_identifier
 from .contracts import StorageLimits
 from .files import ARTIFACT_DIRECTORIES, open_directory, read_file
+from .layout import NAMESPACE_LIMIT, NamespaceDescriptor, validate_directory
 from .placement import (
     DirectoryGuard,
     MountRecord,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 PROFILE = "posix_immutable_v1"
 _REPORT_LIMIT = 128 * 1024
-_NAMESPACE_LIMIT = 16 * 1024
+_NAMESPACE_LIMIT = NAMESPACE_LIMIT
 _LOCAL_CONTROL = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "overlay"}
 
 
@@ -52,13 +53,8 @@ class NamespaceBinding:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "NamespaceBinding":
-        value = exact_fields(
-            parse_json(data, _NAMESPACE_LIMIT), {"format_version", "namespace_id", "stream_id", "run_epoch"}
-        )
-        version = value.pop("format_version")
-        if type(version) is not int or version != 1:
-            raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_format")
-        return cls(**value)
+        descriptor = NamespaceDescriptor.from_bytes(data)
+        return cls(descriptor.namespace_id, descriptor.stream_id, descriptor.run_epoch)
 
 
 @dataclass(frozen=True)
@@ -223,8 +219,10 @@ class DeploymentAdmission:
 
     def validate_artifact(self, descriptor: int) -> None:
         self.artifact_guard.validate_opened(descriptor)
-        _check_namespace(descriptor, self.config.namespace, initializing=self.initializing)
-        _check_artifact_directories(descriptor, self.artifact_guard, allow_missing=self.config.access == "publisher")
+        namespace = _check_namespace(descriptor, self.config.namespace, initializing=self.initializing)
+        _check_artifact_directories(
+            descriptor, self.artifact_guard, namespace, self.config.access_policy.shared_group_id
+        )
 
     def prepare_control(self, location: Path) -> DirectoryGuard:
         if self.control_guard is None or location.resolve() != self.control_guard.path.resolve():
@@ -233,39 +231,56 @@ class DeploymentAdmission:
         return self.control_guard
 
 
-def _check_artifact_directories(descriptor: int, guard: DirectoryGuard, *, allow_missing: bool) -> None:
-    for name in ARTIFACT_DIRECTORIES:
-        try:
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-        except FileNotFoundError:
-            if allow_missing:
-                continue
-            raise
-        try:
-            guard.validate_child_mount(child)
-        finally:
-            os.close(child)
-
-
-def _check_namespace(descriptor: int, expected: NamespaceBinding, *, initializing: bool = False) -> None:
+def _check_artifact_directories(
+    descriptor: int, guard: DirectoryGuard, namespace: NamespaceDescriptor | None, group_id: int | None
+) -> None:
+    if namespace is None:
+        return
+    parent = descriptor
     try:
-        actual = NamespaceBinding.from_bytes(read_file(descriptor, "namespace.json", _NAMESPACE_LIMIT))
+        if namespace.layout is not None:
+            parent = os.open(namespace.layout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            validate_directory(parent, guard, group_id)
+        for name in ARTIFACT_DIRECTORIES:
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                validate_directory(child, guard, group_id)
+            finally:
+                os.close(child)
+    finally:
+        if parent != descriptor:
+            os.close(parent)
+
+
+def _check_namespace(
+    descriptor: int, expected: NamespaceBinding, *, initializing: bool = False
+) -> NamespaceDescriptor | None:
+    namespace = None
+    try:
+        namespace = NamespaceDescriptor.from_bytes(read_file(descriptor, "namespace.json", _NAMESPACE_LIMIT))
     except FileNotFoundError:
         if not initializing:
             raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_missing") from None
     else:
-        if actual != expected:
+        if (namespace.namespace_id, namespace.stream_id, namespace.run_epoch) != (
+            expected.namespace_id,
+            expected.stream_id,
+            expected.run_epoch,
+        ):
             raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_binding")
     try:
         authority = parse_json(read_file(descriptor, "authority.json", _NAMESPACE_LIMIT), _NAMESPACE_LIMIT)
     except FileNotFoundError:
-        return
+        return namespace
+    if namespace is None:
+        raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "authority_without_namespace")
     authority = exact_fields(authority, {"format_version", "authority_id", "stream_id", "run_epoch"})
     if type(authority["format_version"]) is not int or authority["format_version"] != 1:
         raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "authority_format")
     require_identifier(authority["authority_id"], "authority_id")
     if (authority["stream_id"], authority["run_epoch"]) != (expected.stream_id, expected.run_epoch):
         raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "authority_binding")
+    return namespace
 
 
 def _volume_guard(
@@ -327,8 +342,6 @@ def _inspect(
                 require_separate(left, right)
         if initializing and config.access != "publisher":
             raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "namespace_initialization_requires_publisher")
-        if len(config.namespace.to_bytes()) > storage_limits.max_record_bytes:
-            raise StorageDeploymentError("RESOURCE_EXHAUSTED", "namespace_metadata_budget")
         mounts = read_mounts()
         volumes: dict[str, tuple[int, int, str]] = {}
         observed: dict[tuple[str, str, str], str] = {}
@@ -372,8 +385,16 @@ def _inspect(
         descriptor = open_directory(config.artifact_root)
         try:
             guards["artifact"].validate_opened(descriptor)
-            _check_namespace(descriptor, config.namespace, initializing=initializing)
-            _check_artifact_directories(descriptor, guards["artifact"], allow_missing=config.access == "publisher")
+            namespace = _check_namespace(descriptor, config.namespace, initializing=initializing)
+            if namespace is None:
+                metadata = NamespaceDescriptor(**asdict(config.namespace), layout="layout-" + "0" * 32).to_bytes()
+            else:
+                metadata = read_file(descriptor, "namespace.json", _NAMESPACE_LIMIT)
+            if len(metadata) > storage_limits.max_record_bytes:
+                raise StorageDeploymentError("RESOURCE_EXHAUSTED", "namespace_metadata_budget")
+            _check_artifact_directories(
+                descriptor, guards["artifact"], namespace, config.access_policy.shared_group_id
+            )
         finally:
             os.close(descriptor)
         checks.append(DeploymentCheck("namespace", "PASSED", "INITIALIZATION_REQUESTED" if initializing else "OK"))

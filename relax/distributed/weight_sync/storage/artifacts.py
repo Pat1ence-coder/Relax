@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import threading
+from dataclasses import asdict
 from pathlib import Path
 
 from ..codec import EncodedChunk
@@ -15,6 +16,14 @@ from ..schema import require_digest
 from .contracts import ObjectReceipt, StorageLimits, StoreCapabilities
 from .deployment import PROFILE, DeploymentAdmission, DeploymentReport
 from .files import ARTIFACT_DIRECTORIES, child_directory, exclusive_lock, install_file, open_directory, read_file
+from .layout import (
+    LAYOUT_NAME,
+    NamespaceDescriptor,
+    layout_inventory,
+    prepare_layout,
+    read_descriptor,
+    validate_directory,
+)
 from .placement import DirectoryGuard, StorageDeploymentError, require_separate
 from .repository import read_manifest, validate_artifacts, write_manifest
 
@@ -55,6 +64,9 @@ class PosixArtifactStore:
         self._poisoned = False
         self._reservations: dict[str, tuple[int, str]] = {}
         self._directories: dict[str, int] = {}
+        self._layout_fd: int | None = None
+        self._namespace: NamespaceDescriptor | None = None
+        self._layout_pending = False
         self._bytes = self._objects = 0
         try:
             if _admission is not None:
@@ -66,30 +78,53 @@ class PosixArtifactStore:
                 self._lock = exclusive_lock(self._fd, ".writer.lock")
                 if _admission is not None:
                     _admission.validate_artifact(self._fd)
-            for name in _DIRECTORIES:
-                policy = None if _admission is None else _admission.config.access_policy
-                descriptor = child_directory(
+            self._namespace = read_descriptor(self._fd)
+            policy = None if _admission is None else _admission.config.access_policy
+            guard = None if _admission is None else _admission.artifact_guard
+            self._layout_pending = _admission is not None and self._namespace is None
+            if self._layout_pending:
+                if not writable or not _admission.initializing:
+                    raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_missing")
+                self._inventory()
+                binding = asdict(_admission.config.namespace)
+                metadata = NamespaceDescriptor(**binding, layout="layout-" + "0" * 32).to_bytes()
+                require_uint(self._objects + 7, "layout objects", storage_limits.max_objects)
+                require_uint(self._bytes + 6 * 4096 + len(metadata), "layout bytes", storage_limits.max_bytes)
+                name = prepare_layout(
                     self._fd,
+                    mode=policy.directory_mode,
+                    group_id=policy.shared_group_id,
+                    guard=guard,
+                    limits=storage_limits,
+                )
+                self._namespace = NamespaceDescriptor(**binding, layout=name)
+            parent = self._fd
+            if self._namespace is not None and self._namespace.layout is not None:
+                parent = self._layout_fd = child_directory(self._fd, self._namespace.layout)
+                validate_directory(parent, guard, None if policy is None else policy.shared_group_id)
+            for name in _DIRECTORIES:
+                descriptor = child_directory(
+                    parent,
                     name,
-                    create=writable,
+                    create=writable and _admission is None and self._namespace is None,
                     mode=0o700 if policy is None else policy.directory_mode,
                     group_id=None if policy is None else policy.shared_group_id,
                 )
                 self._directories[name] = descriptor
-                if _admission is not None:
-                    _admission.artifact_guard.validate_child_mount(descriptor)
                 if policy is not None:
-                    info = os.fstat(descriptor)
-                    if info.st_mode & 0o022:
-                        raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "artifact_directory_write_policy")
-                    if policy.shared_group_id is not None and (
-                        info.st_gid != policy.shared_group_id or info.st_mode & 0o050 != 0o050
-                    ):
-                        raise StorageDeploymentError("STORAGE_PERMISSION_DENIED", "artifact_directory_group_policy")
+                    validate_directory(descriptor, guard, policy.shared_group_id)
             if writable:
                 self._inventory(clean_temporaries=True)
-                if _admission is not None and _admission.initializing:
-                    self.put_object("namespace.json", _admission.config.namespace.to_bytes())
+                if self._layout_pending:
+                    self.put_object("namespace.json", self._namespace.to_bytes())
+                    self._layout_pending = False
+                elif _admission is not None and _admission.initializing:
+                    # A previous publisher may have linked the descriptor and
+                    # stopped before completing its final durability barrier.
+                    for fd in self._directories.values():
+                        os.fsync(fd)
+                    os.fsync(parent)
+                    os.fsync(self._fd)
         except BaseException:
             self.close()
             raise
@@ -106,6 +141,9 @@ class PosixArtifactStore:
         for fd in self._directories.values():
             os.close(fd)
         self._directories.clear()
+        if self._layout_fd is not None:
+            os.close(self._layout_fd)
+            self._layout_fd = None
         if self._lock is not None:
             os.close(self._lock)
             self._lock = None
@@ -120,9 +158,13 @@ class PosixArtifactStore:
     def capabilities(self) -> StoreCapabilities:
         if self._fd < 0:
             raise DeltaCodecError("artifact store is closed")
-        requirements = ("atomic_hard_link", "advisory_writer_lock", "file_fsync", "directory_fsync")
-        if self._admission is not None and self._admission.config.access_policy.shared_group_id is not None:
-            requirements += ("atomic_directory_noreplace",)
+        requirements = (
+            "atomic_hard_link",
+            "advisory_writer_lock",
+            "linux_ofd_write_lock",
+            "file_fsync",
+            "directory_fsync",
+        )
         return StoreCapabilities(
             backend="posix",
             profile=PROFILE,
@@ -187,18 +229,32 @@ class PosixArtifactStore:
         return self._directories[directory], name
 
     def _inventory(self, *, clean_temporaries: bool = False) -> None:
-        total = count = 0
+        active = None if self._namespace is None else self._namespace.layout
+        _, count, total = layout_inventory(
+            self._fd,
+            active,
+            self.storage_limits,
+            None if self._admission is None else self._admission.artifact_guard,
+        )
+        scanned = 0
         for prefix, fd in (("", self._fd), *self._directories.items()):
             with os.scandir(fd) as entries:
                 for entry in entries:
-                    if not prefix and (entry.name in _DIRECTORIES or entry.name == ".writer.lock"):
+                    scanned += 1
+                    require_uint(scanned, "inventory entries", self.storage_limits.max_objects + 8)
+                    if not prefix and (entry.name == ".writer.lock" or LAYOUT_NAME.fullmatch(entry.name)):
                         continue
-                    if _TEMP.fullmatch(entry.name) and clean_temporaries:
+                    if not prefix and entry.name in _DIRECTORIES and active is None and not self._layout_pending:
+                        continue
+                    retained_temporary = not prefix and (active is not None or self._layout_pending)
+                    temporary = _TEMP.fullmatch(entry.name) is not None
+                    if temporary and clean_temporaries and not retained_temporary:
                         os.unlink(entry.name, dir_fd=fd)
                         os.fsync(fd)
                         continue
                     key = f"{prefix}/{entry.name}" if prefix else entry.name
-                    self._location(key)
+                    if not (temporary and retained_temporary):
+                        self._location(key)
                     info = entry.stat(follow_symlinks=False)
                     if not stat.S_ISREG(info.st_mode):
                         raise DeltaCodecError("artifact must be a regular file")
@@ -231,7 +287,7 @@ class PosixArtifactStore:
         if self._recovering and not (key.startswith("catalog/") or key in ("authority.json", "namespace.json")):
             raise DeltaCodecError("publication recovery must finish before new artifact uploads")
         if key == "namespace.json" and self._admission is not None:
-            if data != self._admission.config.namespace.to_bytes():
+            if self._namespace is None or data != self._namespace.to_bytes():
                 raise StorageDeploymentError("STORAGE_NAMESPACE_MISMATCH", "namespace_write_conflict")
         if type(data) is not bytes:
             raise DeltaCodecError("artifact must be immutable bytes")

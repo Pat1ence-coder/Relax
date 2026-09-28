@@ -18,6 +18,7 @@ class StorageLimits:
     max_archive_bytes: int = 1024 * 1024
     max_chain_depth: int = 128
     max_database_bytes: int = 64 * 1024 * 1024
+    max_layouts: int = 16
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:

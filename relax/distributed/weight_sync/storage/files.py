@@ -4,7 +4,10 @@
 import errno
 import fcntl
 import os
+import platform
 import stat
+import struct
+import sys
 import uuid
 from pathlib import Path
 
@@ -33,9 +36,6 @@ def open_directory(path: str | Path, *, create: bool = False) -> int:
 def child_directory(
     parent: int, name: str, *, create: bool = False, mode: int = 0o700, group_id: int | None = None
 ) -> int:
-    if create and group_id is not None:
-        _install_group_directory(parent, name, mode, group_id)
-        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     created = False
     if create:
         try:
@@ -58,72 +58,28 @@ def child_directory(
         raise
 
 
-def _rename_directory_no_replace(parent: int, temporary: str, name: str) -> bool:
-    """Linux atomic directory installation; never fall back to replacement."""
-    import ctypes
-
-    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-    if rename is None:
-        raise DeltaCodecError("atomic directory installation is unsupported")
-    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
-    rename.restype = ctypes.c_int
-    # RENAME_NOREPLACE: unlike os.rename, reject even an existing empty directory.
-    if rename(parent, os.fsencode(temporary), parent, os.fsencode(name), 1) == 0:
-        return True
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
-        return False
-    if error in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
-        raise DeltaCodecError("atomic directory installation is unsupported")
-    raise OSError(error, os.strerror(error))
-
-
-def _remove_prepared_directory(parent: int, name: str) -> None:
-    # rmdir removes only an empty directory, never symlinks, files, mounted
-    # directories or unknown contents. The caller holds the namespace writer lock.
-    try:
-        os.rmdir(name, dir_fd=parent)
-    except FileNotFoundError:
-        return
-    os.fsync(parent)
-
-
-def _install_group_directory(parent: int, name: str, mode: int, group_id: int) -> None:
-    """Prepare modes privately under the exclusive namespace writer lock."""
-    if name not in ARTIFACT_DIRECTORIES:
-        raise DeltaCodecError("group directory requires a reserved artifact name")
-    temporary = ".tmp-dir-" + name
-    _remove_prepared_directory(parent, temporary)
-    try:
-        os.stat(name, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        # An earlier installation may have stopped before syncing its parent.
-        # Existing directories are never chmodded or replaced.
-        os.fsync(parent)
-        return
-    descriptor = -1
-    try:
-        os.mkdir(temporary, mode=0o700, dir_fd=parent)
-        descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-        os.fchown(descriptor, -1, group_id)
-        os.fchmod(descriptor, mode)
-        os.fsync(descriptor)
-        _rename_directory_no_replace(parent, temporary, name)
-        os.fsync(parent)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        _remove_prepared_directory(parent, temporary)
-
-
 def exclusive_lock(directory: int, name: str) -> int:
+    # Linux LP64 struct flock: short type/whence, off_t start/length, pid_t pid.
+    # Never silently fall back to flock: some shared mounts enforce it locally.
+    if (
+        sys.platform != "linux"
+        or platform.machine() not in {"x86_64", "aarch64"}
+        or tuple(struct.calcsize(kind) for kind in ("P", "l", "h", "i")) != (8, 8, 2, 4)
+        or struct.calcsize("@hhqqi4x") != 32
+        or not hasattr(fcntl, "F_OFD_SETLK")
+    ):
+        raise DeltaCodecError("Linux OFD locks require a supported 64-bit ABI and runtime")
     fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise DeltaCodecError("lock must be a regular file")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record = struct.pack("@hhqqi4x", fcntl.F_WRLCK, os.SEEK_SET, 0, 0, 0)
+        try:
+            fcntl.fcntl(fd, fcntl.F_OFD_SETLK, record)
+        except OSError as error:
+            if error.errno in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+                raise DeltaCodecError("Linux OFD locks are unsupported on this deployment") from None
+            raise
         os.fsync(directory)
         return fd
     except BaseException:

@@ -10,7 +10,7 @@ filesystem, SQLite, Ray, GPU, or network resources.
 
 - The artifact root is an application-owned POSIX directory with a trusted
   publisher ACL. Consumers may mount it read-only. The deployment must support
-  advisory locks, atomic hard links, and durable file/directory `fsync`.
+  Linux OFD advisory locks, atomic hard links, and durable file/directory `fsync`.
   Actual shared-filesystem behavior must be verified on the target mount.
 - `ProducerCatalog(local_control_dir, ...)` uses a **separate local persistent
   volume** for SQLite WAL and the authority lock. Never place this directory on
@@ -20,6 +20,14 @@ filesystem, SQLite, Ray, GPU, or network resources.
   use of an inherited writer after fork. The local authority also has an
   exclusive process lock. These locks do not implement automatic cross-host
   takeover. Other clients must not write directly to the reserved roots.
+- The lock adapter uses nonblocking `F_OFD_SETLK` on 64-bit Linux x86-64/AArch64.
+  Unsupported ABIs, runtimes or filesystems fail without a weaker fallback.
+  OFD locks remain held until the last descriptor for that open file description
+  closes; opening and closing another descriptor does not release the lock.
+  Cross-node conflict and process-exit recovery must still be tested on the
+  target mount. Stop all old writers before upgrading: previous releases used
+  `flock`, which cannot be assumed to conflict with OFD locks. Do not mix writer
+  lock protocols, even when reusing a compatible format-v1 namespace.
 - Each root is authorized for one stream/epoch and bound to one persistent
   authority ID. Reopening a different control database against the same root
   fails. Epoch transitions, authority rollback/restore, and distributed fencing
@@ -50,11 +58,12 @@ shared volume. For a volume containing other workloads, a suggested layout is:
         <run-epoch>/                 # artifact_root
           namespace.json
           authority.json
-          chunks/
-          indexes/
-          manifests/
-          catalog/
-          archives/
+          layout-<uuid>/             # selected by namespace.json
+            chunks/
+            indexes/
+            manifests/
+            catalog/
+            archives/
 ```
 
 Set `artifact_root` to the final epoch directory. This naming convention is a
@@ -171,11 +180,14 @@ initialize_namespace(deployment, limits=limits, storage_limits=storage_limits)
 ```
 
 The marker is separate from `authority.json` and does not change schema,
-manifest or payload identities. Enrollment checks an existing authority's
-stream/epoch and never overwrites a conflicting marker. Its bytes and object
-slot count toward the normal artifact quotas. Existing roots require explicit
-enrollment before using the strict entry point; low-level callers remain
-compatible with roots without the marker.
+manifest or payload identities. New enrollment creates a format-v2 descriptor
+containing the namespace/stream/epoch binding and one relative `layout-<uuid>`
+directory name. Its bytes and object slot count toward the normal artifact
+quotas. A complete format-v1 namespace continues to use its original flat
+directories; it is not migrated or rewritten. Missing published directories
+fail for both roles, including publishers. An unbound legacy directory with
+existing artifacts requires explicit migration outside this initializer;
+low-level callers remain compatible with roots without a marker.
 
 For a configured publisher, recovery precedes ordinary uploads:
 
@@ -216,14 +228,22 @@ Unconfigured stores keep their earlier `0700` / `0444` behavior. Legacy private
 subdirectories are not silently migrated to group access. Actual cross-UID/ACL
 behavior still requires testing with the real reader identity.
 
-Group directory creation prepares an empty `.tmp-dir-<artifact-name>` directory
-under the exclusive writer lock, applies the group and mode, and fsyncs it before
-installation. This mode requires Linux `renameat2(RENAME_NOREPLACE)` support in
-the runtime and filesystem; unsupported installation fails without a replacing
-fallback. The parent is fsynced after installation. Retrying removes only empty
-reserved preparation directories and never changes existing final directories.
-Files, symlinks or unknown contents in a preparation location stop recovery.
-Use the original group policy to recover an interrupted initialization.
+Namespace initialization holds the exclusive writer lock and creates a unique,
+private layout directory. It prepares all five child directories, applies the
+configured modes/groups, verifies each mount, and fsyncs the directories and
+parent before publishing the descriptor. Publication uses the same immutable
+file hard-link protocol as artifacts; directory rename support is not required.
+Only the descriptor selects a usable layout. Readers never inspect unpublished
+layouts, and namespace readiness does not replace catalog publication checks.
+
+A retry after descriptor publication validates and reuses that layout, including
+when the previous final parent fsync failed. Before publication, retries prepare
+a new layout instead of modifying an ambiguous leftover. Unpublished layout
+directories and root descriptor temporaries are retained and charged on restart.
+Layouts may contain only the five reserved child directories; unpublished
+children must be empty. Unexpected objects, symlinks or submounts stop recovery
+without cleanup. Old `.tmp-dir-*` preparation objects are not adopted or deleted.
+Repeated initialization with a valid descriptor creates no additional layouts.
 
 `inspect_deployment(...)` performs read-only configuration/placement checks and
 returns a bounded serializable `DeploymentReport`. It performs no challenge
@@ -380,7 +400,14 @@ partial weight file as either the old base or a reusable complete target.
 
 `StorageLimits` defaults to 1 TiB final artifact bytes, 1,048,576 final objects,
 4,096 publication records, 16 KiB per publication/binding record, 1 MiB per
-archive descriptor, 128 DELTA links, and a 64 MiB main database. Filesystem
+archive descriptor, 128 DELTA links, a 64 MiB main database, and 16 layout
+directories (`max_layouts`, including the selected layout and retained attempts).
+Each layout directory and child consumes one object slot and a fixed 4 KiB
+logical charge from the byte quota, independent of physical directory growth.
+Root descriptor temporaries count as
+separate file entries even when hard-linked to the published descriptor. Scans
+are bounded; exhausted budgets stop initialization before another attempt.
+These logical charges do not measure all physical filesystem overhead. Filesystem
 metadata, SQLite WAL/shared-memory files, and page cache consume additional
 resources; the main database limit is not a total process/disk limit. One
 temporary artifact per synchronous writer adds at most the current object size

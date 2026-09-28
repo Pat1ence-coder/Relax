@@ -27,6 +27,7 @@ from relax.distributed.weight_sync.storage import (
 from relax.distributed.weight_sync.storage import artifacts as artifact_io
 from relax.distributed.weight_sync.storage import deployment as deployment_io
 from relax.distributed.weight_sync.storage import files as file_io
+from relax.distributed.weight_sync.storage import layout as layout_io
 from relax.distributed.weight_sync.storage import placement as placement_io
 
 
@@ -77,6 +78,11 @@ def inspect(config: PosixDeployment) -> DeploymentReport:
 
 def initialize(config: PosixDeployment) -> None:
     initialize_namespace(config, limits=LIMITS, storage_limits=STORAGE)
+
+
+def physical_root(config: PosixDeployment) -> Path:
+    descriptor = layout_io.NamespaceDescriptor.from_bytes((config.artifact_root / "namespace.json").read_bytes())
+    return config.artifact_root if descriptor.layout is None else config.artifact_root / descriptor.layout
 
 
 def test_mount_table_parser_bounds_input_unescapes_paths_and_discards_secrets() -> None:
@@ -210,7 +216,8 @@ def test_group_read_policy_only_sets_modes_on_new_objects(configured: PosixDeplo
     candidate = replace(configured, access_policy=PosixAccessPolicy(shared_group_id=os.getegid()))
     initialize(candidate)
     root_mode = candidate.artifact_root.stat().st_mode
-    assert (candidate.artifact_root / "chunks").stat().st_mode & 0o777 == 0o750
+    assert (physical_root(candidate) / "chunks").stat().st_mode & 0o777 == 0o750
+    assert physical_root(candidate).stat().st_mode & 0o777 == 0o750
     assert (candidate.artifact_root / "namespace.json").stat().st_mode & 0o777 == 0o440
     assert candidate.artifact_root.stat().st_mode == root_mode
 
@@ -259,8 +266,8 @@ def test_mount_coordinates_reject_alias_overlap_but_allow_siblings(
         info = path.stat()
         return info.st_dev, info.st_ino
 
-    artifact_ids = {identity(configured.artifact_root)} | {
-        identity(configured.artifact_root / name) for name in file_io.ARTIFACT_DIRECTORIES
+    artifact_ids = {identity(configured.artifact_root), identity(physical_root(configured))} | {
+        identity(physical_root(configured) / name) for name in file_io.ARTIFACT_DIRECTORIES
     }
     control_id = identity(configured.control_root)
 
@@ -319,7 +326,7 @@ def test_different_mount_devices_do_not_prove_separation(tmp_path: Path) -> None
         placement_io.require_mount_separation(left, first, right, second)
 
 
-@pytest.mark.parametrize("name", file_io.ARTIFACT_DIRECTORIES)
+@pytest.mark.parametrize("name", (*file_io.ARTIFACT_DIRECTORIES, "."))
 @pytest.mark.parametrize("access", ["publisher", "reader"])
 def test_existing_submount_is_rejected_before_any_writer_operation(
     configured: PosixDeployment, monkeypatch: pytest.MonkeyPatch, name: str, access: str
@@ -330,7 +337,7 @@ def test_existing_submount_is_rejected_before_any_writer_operation(
         if access == "publisher"
         else replace(configured, access="reader", control_root=None, control_volume=None)
     )
-    child = (configured.artifact_root / name).stat()
+    child = (physical_root(configured) / name).stat()
 
     def mount_id(descriptor: int) -> int:
         info = os.fstat(descriptor)
@@ -352,7 +359,7 @@ def test_child_mount_is_rechecked_after_inspection(
 ) -> None:
     initialize(configured)
     admit = deployment_io._admit
-    child = (configured.artifact_root / "chunks").stat()
+    child = (physical_root(configured) / "chunks").stat()
 
     def changed_after_admission(*args: object, **kwargs: object) -> object:
         admission = admit(*args, **kwargs)
