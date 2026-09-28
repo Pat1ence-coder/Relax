@@ -1,9 +1,13 @@
 # CPU Delta codec and canonical snapshots
 
-This package implements transport-independent lossless chunk encoding and
+The core implements transport-independent lossless chunk encoding and
 verified reconstruction of complete canonical model snapshots. It uses only
-the Python standard library. It does not import
+the Python standard library. Importing the core does not import
 Torch, Ray, Megatron, SGLang, networking, or storage backends.
+
+Explicit [POSIX shared-storage adapters](storage/README.md) add immutable
+artifact files, a local WAL publication authority, sealed offline archives,
+and disk-backed reconstruction without coupling storage to the codec.
 
 ## Contract
 
@@ -246,8 +250,9 @@ abort paths, and 100 synthetic model versions with periodic anchors. A 64 MiB
 virtual model with temporary-file staging checks bounded Python allocations;
 it is not a GPU or transport performance benchmark.
 
-Subsequent work supplies consistent real training snapshots, a trusted manifest
-publication layer, shared-storage/TCP transports, durable version/apply state,
-and the inference Weight Loader. CPU tests do not establish
+The POSIX adapter includes a producer publication authority and offline replay;
+its filesystem guarantees still require validation on the deployment mount.
+Subsequent work supplies consistent real training snapshots, TCP transport,
+consumer durable version/apply state, and the inference Weight Loader. CPU tests do not establish
 resharding correctness, actual loaded weights, fault recovery, or 50% traffic
 savings.
