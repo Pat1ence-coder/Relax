@@ -3,6 +3,7 @@
 these."""
 
 from .artifacts import PosixArtifactStore
+from .capture import DiskCapture, FrozenExport
 from .catalog import ProducerCatalog, Publication, PublicationUncertain
 from .contracts import ObjectReceipt, StorageLimits, StorageReader, StorageWriter, StoreCapabilities
 from .deployment import (
@@ -24,9 +25,11 @@ from .staging import DiskSnapshotReader, DiskSnapshotStore, DiskStaging, open_sn
 __all__ = [
     "DeploymentCheck",
     "DeploymentReport",
+    "DiskCapture",
     "DiskSnapshotReader",
     "DiskSnapshotStore",
     "DiskStaging",
+    "FrozenExport",
     "MountRecord",
     "NamespaceBinding",
     "ObjectReceipt",

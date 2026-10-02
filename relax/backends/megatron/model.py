@@ -12,6 +12,11 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from .weight_sync.boundary import TrainingBoundary
 
 import torch
 from megatron.core import mpu
@@ -970,6 +975,8 @@ def train_one_step(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     step_global_batch_size: int,
+    *,
+    export_boundary: "TrainingBoundary | None" = None,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -1221,7 +1228,9 @@ def train_one_step(
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
     valid_step = True
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad = (
+        optimizer.step() if export_boundary is None else export_boundary.optimizer_step(optimizer)
+    )
 
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         # fp16 with dynamic loss scaling auto-disables this flag (see Megatron arguments.py).
@@ -1324,6 +1333,8 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    *,
+    export_boundary: "TrainingBoundary | None" = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -1465,6 +1476,7 @@ def train(
                 opt_param_scheduler,
                 num_microbatches[step_id],
                 global_batch_sizes[step_id],
+                export_boundary=export_boundary,
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)
@@ -1597,6 +1609,9 @@ def train(
         # branch/parameter-gather order. Per-step sync above has made weights current.
         enable_forward_pre_hook(model)
         config.param_sync_func = param_sync_func
+
+    if export_boundary is not None:
+        export_boundary.mark_synchronized()
 
 
 def save(

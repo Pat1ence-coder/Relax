@@ -2,6 +2,16 @@
 """Portable weight-sync primitives; no backend or transport initialization."""
 
 from .codec import ChunkDescriptor, Codec, DeltaEncoder, EncodedChunk
+from .export import (
+    CanonicalTile,
+    ExportBudget,
+    ExportRequest,
+    SnapshotLease,
+    SourceExportPlan,
+    SourceReceipt,
+    TensorOwner,
+    validate_receipts,
+)
 from .integrity import ModelRoot
 from .limits import CodecLimits, DeltaCodecError, SnapshotLimits
 from .manifest import ChunkRecord, IndexPage, Manifest, PageRef, SnapshotIdentity
@@ -23,6 +33,7 @@ __all__ = [
     "ArtifactReader",
     "ArtifactWriter",
     "CanonicalChunk",
+    "CanonicalTile",
     "ChunkDescriptor",
     "ChunkReader",
     "ChunkRecord",
@@ -32,19 +43,26 @@ __all__ = [
     "DeltaCodecError",
     "DeltaEncoder",
     "EncodedChunk",
+    "ExportBudget",
+    "ExportRequest",
     "IndexPage",
     "Manifest",
     "ModelRoot",
     "ModelSchema",
     "PageRef",
     "SnapshotIdentity",
+    "SnapshotLease",
     "SnapshotLimits",
+    "SourceExportPlan",
+    "SourceReceipt",
     "StagingSink",
     "TensorEntry",
+    "TensorOwner",
     "TensorSpec",
     "VerifiedSnapshot",
     "build_manifest",
     "iter_chunks",
     "reconstruct",
+    "validate_receipts",
     "verify_snapshot",
 ]

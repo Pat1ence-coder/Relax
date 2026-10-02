@@ -9,6 +9,7 @@ import threading
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 from ..codec.format import content_hash
 from ..limits import DeltaCodecError, SnapshotLimits, require_uint
@@ -18,6 +19,15 @@ from ..schema import CanonicalChunk, ChunkSpec
 from ..serialization import canonical_json, exact_fields, parse_json
 from ..snapshot import VerifiedSnapshot, verify_snapshot
 from .files import child_directory, exclusive_lock, install_file, open_directory, read_file, write_all
+
+
+if TYPE_CHECKING:
+    from ..export import ExportBudget, ExportRequest, SourceExportPlan
+    from .capture import DiskCapture
+
+
+class _UnfinishedGeneration(Protocol):
+    def abort(self) -> None: ...
 
 
 _GENERATION = re.compile(r"generation-[0-9a-f]{32}")
@@ -123,7 +133,7 @@ class DiskSnapshotStore:
         self.max_bytes, self.max_generations = max_bytes, max_generations
         self._fd = open_directory(self.root, create=True)
         self._lock: int | None = None
-        self._active: dict[str, DiskStaging] = {}
+        self._active: dict[str, _UnfinishedGeneration] = {}
         try:
             self._lock = exclusive_lock(self._fd, ".writer.lock")
             self._usage(clean_temporaries=True)
@@ -202,6 +212,13 @@ class DiskSnapshotStore:
         if self._lock is None:
             raise DeltaCodecError("snapshot store is closed")
         return DiskStaging(self)
+
+    def capture(self, plan: "SourceExportPlan", request: "ExportRequest", budget: "ExportBudget") -> "DiskCapture":
+        """Capture a new source snapshot whose content root is not yet
+        known."""
+        from .capture import DiskCapture
+
+        return DiskCapture(self, plan, request, budget)
 
     def _discard(self, name: str) -> None:
         directory = child_directory(self._fd, name)
