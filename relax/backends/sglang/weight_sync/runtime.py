@@ -2,9 +2,9 @@
 """Explicit SGLang startup hooks with default-closed request admission.
 
 No existing Relax launcher or default full-sync path is modified. Every spawned
-scheduler installs its own hooks, checks execution settings, and creates a fresh
-nonce. The private install channel correlates complete rank receipts by command
-digest.
+scheduler installs its own hooks, checks execution settings, and creates a
+fresh nonce. The private install channel correlates complete rank receipts by
+command digest.
 """
 
 import asyncio
@@ -57,6 +57,7 @@ class RuntimeConfig:
 
 def _profile(server_args: Any, *, startup: bool = False) -> str:
     from sglang.srt.environ import envs
+    from sglang.srt.managers import io_struct
     from sglang.srt.model_executor.model_runner_components.weight_updater import (
         _unsupported_derived_weight_cache_error,
     )
@@ -76,7 +77,9 @@ def _profile(server_args: Any, *, startup: bool = False) -> str:
     return execution_profile(
         resolved,
         vit_graph=envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get(),
-        pickle_ipc=envs.SGLANG_USE_PICKLE_IPC.get(),
+        # Socket serialization caches this value when io_struct is imported.
+        # A later environment change must not misreport the active transport.
+        pickle_ipc=io_struct._USE_PICKLE_IPC,
         derived_weight_cache=_unsupported_derived_weight_cache_error() is not None,
     )
 
@@ -234,6 +237,18 @@ class _Worker:
                     raise DeltaCodecError("LOAD requires a quiescent group member")
                 self.phase = "LOADING"
                 validate_model_config(self.model, self.model_config)
+                # Existing text graphs retain the startup storage addresses.
+                # Re-enumeration alone would accept newly rebound parameters
+                # or caches while a graph continued to read the old storage.
+                # Eager MRoPE may convert FP32 to BF16 on its first request.
+                # Re-inventory that cache only when no graph can retain it;
+                # weight bindings are always strict, including eager mode.
+                runner = self.scheduler.tp_worker.model_runner
+                captured = any(
+                    getattr(getattr(getattr(runner, phase + "_cuda_graph_runner"), "backend", None), "_graphs", None)
+                    for phase in ("prefill", "decode")
+                )
+                self.inventory.validate_bindings(captured_buffers=captured)
                 self.inventory = inspect_inventory(self.model, self.plan, self.rank)
                 self.prepared = PreparedLoad(self.snapshot, self.inventory, value, _WorkerLease(self, value))
                 self.prepared.load()
@@ -603,27 +618,6 @@ def create_engine(runtime_config: RuntimeConfig, **kwargs: Any) -> Any:
     from sglang.srt.server_args import ServerArgs
 
     from relax.distributed.weight_sync.consumer import Member
-
-    defaults = {
-        "dtype": "bfloat16",
-        "model_impl": "sglang",
-        "bf16_gemm_backend": "torch",
-        "attention_backend": "triton",
-        "mm_attention_backend": "sdpa",
-        "disable_overlap_schedule": True,
-        "disable_cuda_graph": True,
-        "cuda_graph_backend_prefill": "disabled",
-        "cuda_graph_backend_decode": "disabled",
-        "skip_server_warmup": True,
-        "warmups": None,
-        "weight_cache_mode": "off",
-        "enable_lora": False,
-        "enable_memory_saver": False,
-        "enable_mm_global_cache": False,
-        "enable_prefix_mm_cache": False,
-    }
-    for key, value in defaults.items():
-        kwargs.setdefault(key, value)
 
     server_args = kwargs.get("server_args") or ServerArgs(**kwargs)
     _profile(server_args, startup=True)

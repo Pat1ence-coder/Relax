@@ -32,8 +32,9 @@ class TargetInventory:
     bindings: Mapping[str, tuple]
     binding_id: str
     derived_buffers: tuple[str, ...]
+    derived_bindings: Mapping[str, tuple]
 
-    def validate_bindings(self) -> None:
+    def validate_bindings(self, *, captured_buffers: bool = True) -> None:
         current = dict(self.model.named_parameters(remove_duplicate=False))
         if current.keys() != self.tensors.keys():
             raise DeltaCodecError("target parameter directory changed after prepare")
@@ -42,9 +43,13 @@ class TargetInventory:
                 raise DeltaCodecError("target storage changed after prepare")
             if str(tensor.dtype) != "torch.bfloat16" or not tensor.is_contiguous():
                 raise DeltaCodecError("target dtype or contiguity changed after prepare")
-        names = tuple(sorted(name for name, _ in self.model.named_buffers(remove_duplicate=False)))
+        buffers = dict(self.model.named_buffers(remove_duplicate=False))
+        names = tuple(sorted(buffers))
         if names != self.derived_buffers:
             raise DeltaCodecError("target buffer directory changed after prepare")
+        for name, tensor in buffers.items():
+            if captured_buffers and (storage_binding(tensor), str(tensor.dtype)) != self.derived_bindings[name]:
+                raise DeltaCodecError("target execution buffer storage changed after capture")
 
 
 def inspect_inventory(model: Any, plan: LoadPlan, rank: int, *, allow_cpu: bool = False) -> TargetInventory:
@@ -122,7 +127,7 @@ def inspect_inventory(model: Any, plan: LoadPlan, rank: int, *, allow_cpu: bool 
         ranges.sort()
         if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
             raise DeltaCodecError("undeclared or partial target storage alias")
-    derived = []
+    derived = {}
     for name, buffer in model.named_buffers(remove_duplicate=False):
         parent, _, leaf = name.rpartition(".")
         owner = modules[parent]
@@ -139,12 +144,19 @@ def inspect_inventory(model: Any, plan: LoadPlan, rank: int, *, allow_cpu: bool 
             or not buffer.is_contiguous()
         ):
             raise DeltaCodecError(f"unclassified target buffer: {name}")
-        derived.append(name)
+        derived[name] = (storage_binding(buffer), str(buffer.dtype))
     identity = content_hash(
         canonical_json(
             {"plan": plan.plan_id, "rank": rank, "bindings": bindings}, plan.schema.limits.max_directory_bytes
         )
     )
     return TargetInventory(
-        model, plan, rank, MappingProxyType(tensors), MappingProxyType(bindings), identity, tuple(sorted(derived))
+        model,
+        plan,
+        rank,
+        MappingProxyType(tensors),
+        MappingProxyType(bindings),
+        identity,
+        tuple(sorted(derived)),
+        MappingProxyType(derived),
     )

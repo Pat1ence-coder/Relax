@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Certified eager execution state, refreshed only while every rank is idle."""
+"""Execution caches refreshed in place while every rank is idle."""
 
 import hashlib
 from typing import Any
@@ -34,6 +34,23 @@ def validate_model_config(model: Any, config: dict) -> None:
             raise DeltaCodecError(f"actual model config differs: {prefix}")
 
     compare(config, actual, "model")
+
+
+def _refresh_cache_in_place(cache: Any, replacement: Any) -> None:
+    """Preserve storage retained by already captured text CUDA graphs."""
+    if cache.shape != replacement.shape or cache.device != replacement.device or not cache.is_contiguous():
+        raise DeltaCodecError("rotary refresh would change captured storage")
+    cache.copy_(replacement)
+
+
+def _compute_rotary_cache(module: Any, rows: int) -> Any:
+    """Recompute the full runtime capacity, including graph warmup padding."""
+    import torch
+
+    inv_freq = module._compute_inv_freq(module.base)
+    positions = torch.arange(rows, dtype=torch.float, device=module.cos_sin_cache.device)
+    freqs = torch.einsum("i,j -> ij", positions, inv_freq)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
 
 
 def _execution_state(model: Any, config: dict, *, max_bytes: int, tile_bytes: int, refresh: bool) -> str:
@@ -83,26 +100,31 @@ def _execution_state(model: Any, config: dict, *, max_bytes: int, tile_bytes: in
                 or module.mrope_interleaved_glm != rope_config.get("mrope_interleaved_glm", False)
             ):
                 raise DeltaCodecError("MRoPE section/interleave semantics differ")
-            cache_bytes = expected["max_position_embeddings"] * expected["rotary_dim"] * 4
+            cache = module.cos_sin_cache
+            # SGLang extends both text and vision caches before graph capture
+            # to the runtime context capacity plus padding. Logical model
+            # limits remain unchanged, and these extra rows must be retained.
+            if cache.ndim != 2 or cache.shape[0] < expected["max_position_embeddings"]:
+                raise DeltaCodecError("rotary cache has insufficient position capacity")
+            cache_bytes = cache.shape[0] * expected["rotary_dim"] * 4
             old_bytes = module.cos_sin_cache.numel() * module.cos_sin_cache.element_size()
             if resident_bytes + old_bytes + 4 * cache_bytes > max_bytes:
                 raise DeltaCodecError("derived execution cache refresh exceeds its allocation budget")
             resident_bytes += cache_bytes
-            cache = type(module)._compute_cos_sin_cache(module) if refresh else module.cos_sin_cache
             if (
                 cache.device != device
-                or cache.dtype != torch.float32
+                or cache.dtype not in (torch.float32, torch.bfloat16)
                 or not cache.is_contiguous()
-                or tuple(cache.shape) != (expected["max_position_embeddings"], expected["rotary_dim"])
+                or cache.shape[1] != expected["rotary_dim"]
             ):
-                raise DeltaCodecError("refreshed rotary cache has unexpected storage")
-            if refresh:
-                module.cos_sin_cache = cache
-                if hasattr(module, "position_cos"):
-                    module.position_cos = None
-                    module.position_sin = None
+                raise DeltaCodecError("rotary cache has unexpected storage")
             if getattr(module, "position_cos", None) is not None or getattr(module, "position_sin", None) is not None:
                 raise DeltaCodecError("unexpected cached rotary positions after quiescent refresh")
+            if refresh:
+                replacement = _compute_rotary_cache(module, cache.shape[0])
+                _refresh_cache_in_place(cache, replacement)
+                del replacement
+            cache_bytes = cache.numel() * cache.element_size()
             descriptor = {
                 "module": name,
                 "semantics": expected,
@@ -117,8 +139,8 @@ def _execution_state(model: Any, config: dict, *, max_bytes: int, tile_bytes: in
     if not descriptors:
         raise DeltaCodecError("expected derived execution state is missing")
     torch.cuda.synchronize(device)
-    # Graph dictionaries must remain empty even though the model allocates a
-    # graph-runner object eagerly. Disabling only prefill/decode is insufficient.
+    # Vision graph support is separate from the text graph path. Do not
+    # silently disable or clear a vision graph to make an installation pass.
     if model.visual.graph_runners.block_graphs:
         raise DeltaCodecError("unexpected captured vision graph")
     return digest.hexdigest()
