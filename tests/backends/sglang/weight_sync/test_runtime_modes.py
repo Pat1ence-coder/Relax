@@ -124,10 +124,14 @@ def test_quiesce_keeps_overlap_running_until_results_are_drained(monkeypatch):
     worker.model = torch.nn.Linear(1, 1)
     worker._reply = lambda *args: events.append("reply")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("synchronize"))
+    monkeypatch.setattr(
+        "relax.backends.sglang.weight_sync.runtime.clear_multimodal_execution_cache",
+        lambda: events.append("multimodal_cache") or {},
+    )
 
     worker.advance_quiesce()
     assert not scheduler._engine_paused and worker.ticket == "old-generation" and not events
     queue.popleft()
     worker.advance_quiesce()
     assert scheduler._engine_paused and worker.ticket is None
-    assert events == ["synchronize", "flush", "reply"]
+    assert events == ["synchronize", "flush", "multimodal_cache", "reply"]

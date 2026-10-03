@@ -8,6 +8,21 @@ from relax.distributed.weight_sync import DeltaCodecError
 from relax.distributed.weight_sync.serialization import canonical_json
 
 
+def clear_multimodal_execution_cache() -> dict:
+    """Discard image embeddings derived from the previous visual weights."""
+    from sglang.srt.managers import mm_utils
+
+    cache = mm_utils.embedding_cache
+    if cache is None:
+        return {"present": False}
+    evidence = {"present": True, "entries_before": len(cache), "bytes_before": cache.current_size}
+    cache.clear()
+    evidence.update(entries_after=len(cache), bytes_after=cache.current_size)
+    if evidence["entries_after"] or evidence["bytes_after"]:
+        raise DeltaCodecError("multimodal execution cache did not clear")
+    return evidence
+
+
 def validate_model_config(model: Any, config: dict) -> None:
     """Compare supplied logical configuration with the actual loaded model."""
     from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration

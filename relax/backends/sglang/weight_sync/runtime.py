@@ -26,15 +26,22 @@ from relax.distributed.weight_sync.storage import open_snapshot
 from relax.distributed.weight_sync.storage.consumer import installation_from_dict
 
 from .capabilities import execution_profile
-from .execution import refresh_execution_state, validate_model_config, verify_execution_state
+from .execution import (
+    clear_multimodal_execution_cache,
+    refresh_execution_state,
+    validate_model_config,
+    verify_execution_state,
+)
 from .inventory import inspect_inventory
 from .isolation import arm_parent_death, process_identity
 from .loader import PreparedLoad
+from .multimodal import UnsentMultimodalResources, track_multimodal_processor
 from .profiles import qwen3_vl_load_plan
 
 
 _TOKENIZER_TICKET = contextvars.ContextVar("relax_delta_tokenizer_ticket", default=None)
 _SCHEDULER_TICKET = contextvars.ContextVar("relax_delta_scheduler_ticket", default=None)
+_TOKENIZER_RESOURCES = contextvars.ContextVar("relax_delta_tokenizer_resources", default=None)
 
 
 @dataclass(frozen=True)
@@ -328,8 +335,11 @@ class _Worker:
         torch.cuda.synchronize(next(self.model.parameters()).device)
         if not self.scheduler.flush_cache():
             raise DeltaCodecError("scheduler did not reach a flushable quiescent state")
+        # Native flush_cache resets KV/grammar state, but leaves the image
+        # embedding cache (including deepstack features) tied to old weights.
+        multimodal_cache = clear_multimodal_execution_cache()
         self.ticket = None
-        self._reply(command, "QUIESCED", {"idle": True, "cache_flushed": True})
+        self._reply(command, "QUIESCED", {"idle": True, "cache_flushed": True, "multimodal_cache": multimodal_cache})
 
 
 def install_scheduler_hooks(config: RuntimeConfig) -> None:
@@ -451,6 +461,8 @@ def init_delta_tokenizer(server_args: Any, port_args: Any, *, runtime_config: Ru
             self.delta_members = ()
             self.delta_requests = {}
             super().__init__(*args, **kwargs)
+            if self.mm_processor is not None:
+                track_multimodal_processor(self.mm_processor, _TOKENIZER_RESOURCES.get)
             self.delta_profile_id = _profile(self.server_args)
             self._result_dispatcher += TypeBasedDispatcher([(DeltaReply, self._delta_reply)])
 
@@ -460,13 +472,19 @@ def init_delta_tokenizer(server_args: Any, port_args: Any, *, runtime_config: Ru
                 raise DeltaCodecError("consumer is not active")
             generator = super().generate_request(obj, request)
             key = uuid.uuid4().hex
-            record = {"generator": generator, "busy": False}
+            sampling = obj.sampling_params
+            options = sampling if isinstance(sampling, list) else [sampling]
+            resources = UnsentMultimodalResources(
+                self.server_args.tp_size, repeat_inputs=any(option and option.get("n", 1) > 1 for option in options)
+            )
+            record = {"generator": generator, "busy": False, "resources": resources}
             self.delta_requests[key] = record
             try:
                 while True:
                     if ticket != self.delta_ticket or self.delta_poisoned:
                         raise DeltaCodecError("request generation was closed by installation")
                     token = _TOKENIZER_TICKET.set(ticket)
+                    resource_token = _TOKENIZER_RESOURCES.set(resources)
                     record["busy"] = True
                     try:
                         result = await generator.__anext__()
@@ -475,6 +493,7 @@ def init_delta_tokenizer(server_args: Any, port_args: Any, *, runtime_config: Ru
                     finally:
                         record["busy"] = False
                         _TOKENIZER_TICKET.reset(token)
+                        _TOKENIZER_RESOURCES.reset(resource_token)
                     if ticket != self.delta_ticket or self.delta_poisoned:
                         raise DeltaCodecError("request generation was closed by installation")
 
@@ -485,8 +504,13 @@ def init_delta_tokenizer(server_args: Any, port_args: Any, *, runtime_config: Ru
 
                     yield [provenance(item) for item in result] if isinstance(result, list) else provenance(result)
             finally:
-                await generator.aclose()
-                self.delta_requests.pop(key, None)
+                try:
+                    try:
+                        await generator.aclose()
+                    finally:
+                        await resources.close()
+                finally:
+                    self.delta_requests.pop(key, None)
 
         async def delta_drain_requests(self):
             # A client may be suspended after a streaming yield. Closing the
@@ -496,16 +520,39 @@ def init_delta_tokenizer(server_args: Any, port_args: Any, *, runtime_config: Ru
                 for key, record in tuple(self.delta_requests.items()):
                     if not record["busy"]:
                         await record["generator"].aclose()
+                        await record["resources"].close()
                         self.delta_requests.pop(key, None)
                 if self.delta_requests or self.rid_to_state:
                     await asyncio.sleep(0.01)
 
+        def _delta_admission_ticket(self):
+            ticket = _TOKENIZER_TICKET.get()
+            if ticket is None or ticket != self.delta_ticket or self.delta_poisoned:
+                raise DeltaCodecError("request admission generation changed during tokenization")
+            return ticket
+
+        def _send_one_request(self, tokenized_obj):
+            # Preprocessing can await across PREPARE. Reject its old result
+            # before native dispatch allocates receiver-owned shared memory.
+            self._delta_admission_ticket()
+            resources = _TOKENIZER_RESOURCES.get()
+            if resources is not None:
+                resources.prepare(tokenized_obj.mm_inputs)
+                resources.transfer(tokenized_obj.mm_inputs)
+            return super()._send_one_request(tokenized_obj)
+
+        def _send_batch_request(self, tokenized_objs):
+            self._delta_admission_ticket()
+            resources = _TOKENIZER_RESOURCES.get()
+            if resources is not None:
+                for obj in tokenized_objs:
+                    resources.prepare(obj.mm_inputs)
+                    resources.transfer(obj.mm_inputs)
+            return super()._send_batch_request(tokenized_objs)
+
         def _dispatch_to_scheduler(self, obj):
             if isinstance(obj, WORK_TYPES):
-                ticket = _TOKENIZER_TICKET.get()
-                if ticket is None or ticket != self.delta_ticket or self.delta_poisoned:
-                    raise DeltaCodecError("request admission generation changed during tokenization")
-                obj = DeltaWork(ticket=ticket, payload=obj)
+                obj = DeltaWork(ticket=self._delta_admission_ticket(), payload=obj)
             elif not isinstance(obj, (DeltaCommand, AbortReq, ShutdownReq)):
                 raise DeltaCodecError("legacy control cannot bypass consumer installation")
             super()._dispatch_to_scheduler(obj)
