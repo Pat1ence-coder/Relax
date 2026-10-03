@@ -1530,7 +1530,7 @@ index a45d122f..0334e353 100755
          ):
              # Even the last remaining request cannot fit in memory.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a9615a14..3fa13809 100644
+index a9615a14..5122846d 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
@@ -1572,7 +1572,21 @@ index a9615a14..3fa13809 100644
                  (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                  (PauseGenerationReqInput, self.pause_generation),
                  (ContinueGenerationReqInput, self.continue_generation),
-@@ -4457,6 +4468,12 @@ class Scheduler(
+@@ -4146,6 +4157,13 @@ class Scheduler(
+             if self.draft_worker:
+                 self.draft_worker.clear_cache_pool()
+ 
++            # Image embeddings are keyed by content hash only; after a weight
++            # update they would be served from the old vision weights.
++            from sglang.srt.managers import mm_utils
++
++            if mm_utils.embedding_cache is not None:
++                mm_utils.embedding_cache.clear()
++
+             if empty_cache:
+                 current_platform.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+@@ -4457,6 +4475,12 @@ class Scheduler(
                  # The request will still run one decode forward pass.
                  # Then we reuse all existing code to clean up the KV cache allocation.
                  logger.debug(f"Abort running request. {req.rid=}")
@@ -1585,7 +1599,7 @@ index a9615a14..3fa13809 100644
                  req.to_finish = FINISH_ABORT()
  
      def _pause_engine(self) -> Tuple[List[Req], int]:
-@@ -4669,6 +4686,14 @@ class Scheduler(
+@@ -4669,6 +4693,14 @@ class Scheduler(
          result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
          return result
  
