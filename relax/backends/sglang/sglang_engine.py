@@ -34,6 +34,7 @@ from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
+from relax.utils.delta_wire import LOADER_PATH as DELTA_LOADER_PATH
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
@@ -1772,6 +1773,14 @@ def _compute_server_args(
     ):
         # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
         kwargs["cuda_graph_backend_prefill"] = "disabled"
+
+    # Sparse delta weight sync installs deltas through a custom weight loader.
+    if getattr(args, "delta_weight_sync", False) and args.fully_async and not getattr(args, "hybrid", False):
+        loaders = list(kwargs.get("custom_weight_loader") or [])
+        if DELTA_LOADER_PATH not in loaders:
+            loaders.append(DELTA_LOADER_PATH)
+        kwargs["custom_weight_loader"] = loaders
+        unused_keys.discard("custom_weight_loader")
 
     # for compatibility with old args
     if len(unused_keys) > 0:

@@ -995,6 +995,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--delta-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fully-async only: send rollout weight updates as sparse bitwise deltas over the existing "
+                    "NCCL weight-update group and install them in place; any failure falls back to a full sync "
+                    "in the same pause. Requires --megatron-to-hf-mode bridge, PP=1, expert TP=1, no LoRA, "
+                    "unquantized rollout weights and MoE experts in checkpoint layout on the rollout."
+                ),
+            )
+            parser.add_argument(
+                "--delta-verify-interval",
+                type=int,
+                default=0,
+                help=(
+                    "With --delta-weight-sync: re-send every K-th delta version in full and check bitwise that "
+                    "the rollout weights already matched it. 0 disables periodic checks; the first delta after "
+                    "every full sync is always checked."
+                ),
+            )
+            parser.add_argument(
+                "--delta-max-payload-ratio",
+                type=float,
+                default=0.3,
+                help="With --delta-weight-sync: send a full sync when the delta payload exceeds this fraction of it.",
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

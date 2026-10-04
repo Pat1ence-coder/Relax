@@ -2155,6 +2155,23 @@ index 8e957f66..1bd46d38 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
 
+diff --git a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+index ecbfa7a..3b5d951 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
++++ b/python/sglang/srt/model_executor/model_runner_components/weight_updater.py
+@@ -270,7 +270,11 @@ class WeightUpdater:
+             for handle in handles:
+                 handle.wait()
+ 
+-            self.get_model().load_weights(weights)
++            if load_format in self.custom_weight_loaders:
++                custom_loader = dynamic_import(load_format)
++                custom_loader(self.get_model(), weights)
++            else:
++                self.get_model().load_weights(weights)
+             return True, "Succeeded to update parameter online."
+ 
+         except Exception as e:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
 index 08c47b99..06a222fe 100644
 --- a/python/sglang/srt/models/qwen3_5.py

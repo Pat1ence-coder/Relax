@@ -36,6 +36,7 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
+from relax.utils.delta_wire import LOADER_PATH, META_NAME, PONG, encode_meta
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -216,6 +217,21 @@ class DeviceDirectBackend(CommBackend):
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
+
+        # Sparse delta sync of rollout weights (--delta-weight-sync). None when disabled.
+        self._delta = None
+        self._rollout_group_rebuilt = False  # set on the PP-src rank when the NCCL group is (re)built
+        self._rollout_paused = False  # the delta path already paused the engines for this update
+        self._full_meta: Optional[Dict] = None  # loader metadata prefixed to full buckets (verify)
+        is_trainer = model and role_info is not None and role_info.role_name == "actor"
+        if getattr(args, "delta_weight_sync", False) and is_trainer:
+            from relax.backends.megatron.weight_update.delta_sync import SparseDeltaSync, unsupported_reason
+
+            reason = unsupported_reason(args, quantization_config)
+            if reason is None:
+                self._delta = SparseDeltaSync(args, model, self._bridge_converter)
+            else:
+                logger.warning(f"--delta-weight-sync disabled: {reason}; rollout updates stay full.")
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -456,6 +472,7 @@ class DeviceDirectBackend(CommBackend):
             # Rebuild path (first update, topology change, or an unhealthy engine):
             # drop any stale engines/group before recreating, and invalidate the
             # signature until the new group is successfully established.
+            self._rollout_group_rebuilt = True
             if self.rollout_engines:
                 self._cleanup_rollout_engines()
             self._rollout_topology_signature = None
@@ -675,8 +692,46 @@ class DeviceDirectBackend(CommBackend):
                 )
         self._lora_skip_rollout_base = self._lora_adapter_mode and self._lora_sync.base_sync_done
 
+        # Sparse delta sync: try to bring the rollout to this version with a delta first. On
+        # success the rollout part of the full path below is skipped (unless a verification
+        # pass is due); on any failure the full path runs within the same pause window.
+        self._full_meta = None
+        reseed = False
+        if self._delta is not None and not actor_fwd_only:
+            # no committed snapshot, or new/restarted engines: this version must be sent in full
+            reseed = not self._all_ranks_ok(
+                self._delta.committed_version is not None
+                and not (dist.get_rank() == 0 and self._rollout_group_rebuilt)
+            )
+            if reseed:
+                # the engines must route the delta messages to the delta loader; probed while
+                # paused so the probe does not wait behind in-flight generation
+                error = None
+                if dist.get_rank() == 0:
+                    self._pause_rollout()
+                    error = self._check_delta_loader_registered()
+                if not self._all_ranks_ok(error is None):
+                    if dist.get_rank() == 0:
+                        logger.warning(f"--delta-weight-sync disabled for this run: {error}")
+                    self._delta.drop()
+                    self._delta = None
+        if self._delta is not None and not actor_fwd_only:
+            delta_ok = not reseed and self._update_rollout_by_delta()
+            verify = delta_ok and self._delta_verify_due()
+            if delta_ok and not verify:
+                if dist.get_rank() == 0:
+                    self._batch_request("/continue_generation")
+                    self._rollout_paused = False
+                dist.barrier(group=get_gloo_group())
+                if rollout_only:
+                    device_module.empty_cache()
+                    return
+                actor_fwd_only = True
+            else:
+                self._full_meta = {"action": "full", "version": self.weight_version, "verify": verify}
+
         if not actor_fwd_only:
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and not self._rollout_paused:
                 # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
                 ray.get(self._batch_request("/pause_generation"))
@@ -685,6 +740,7 @@ class DeviceDirectBackend(CommBackend):
                 logger.info("Flushing cache on all rollout nodes...")
                 for rank, engine in self.rollout_engines.items():
                     ray.get(engine.flush_cache.remote())
+            self._rollout_paused = False
 
             dist.barrier(group=get_gloo_group())
 
@@ -780,10 +836,13 @@ class DeviceDirectBackend(CommBackend):
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
                 push_failed = bool(flag.item())
+            if self._full_meta is not None:
+                self._reseed_delta_after_full(verify=self._full_meta["verify"])
             if dist.get_rank() == 0:
                 # Continue generation on all rollout nodes
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
+                self._rollout_paused = False
             dist.barrier(group=get_gloo_group())
             if push_failed:
                 # Abort rather than roll out with a stale/absent adapter: in adapter mode the
@@ -809,6 +868,190 @@ class DeviceDirectBackend(CommBackend):
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
+
+    def _update_rollout_by_delta(self) -> bool:
+        """Install ``self.weight_version`` on the rollout engines as a sparse
+        delta on top of the committed version (collective).
+
+        Returns True when every engine committed the delta. On False the
+        rollout engines may already be paused (``self._rollout_paused``) and
+        must receive a full sync.
+        """
+        from relax.backends.megatron.weight_update.delta_sync import DeltaUnavailable
+
+        delta, version, rank = self._delta, self.weight_version, dist.get_rank()
+        base = delta.committed_version
+        start = time.time()
+
+        reason = None
+        entries = []
+        try:
+            entries = delta.compute_local()
+        except DeltaUnavailable as e:
+            reason = str(e)
+        except Exception as e:  # noqa: BLE001 - fall back to a full sync
+            logger.exception("Delta computation failed")
+            reason = f"{type(e).__name__}: {e}"
+        if reason is not None:
+            logger.info(f"[delta] v{version}: rank {rank} cannot send a delta ({reason})")
+        if not self._all_ranks_ok(reason is None):
+            return False
+
+        buckets = []
+        try:
+            merged = delta.gather_to_rank0(entries)
+            if rank == 0:
+                payload = delta.payload_bytes(merged)
+                if payload > self.args.delta_max_payload_ratio * delta.total_bytes:
+                    reason = f"payload {payload} B exceeds {self.args.delta_max_payload_ratio} of full"
+                else:
+                    buckets = delta.pack(merged, base, version, self.args.update_weight_buffer_size)
+                del merged
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Delta gather/pack failed")
+            reason = f"{type(e).__name__}: {e}"
+        del entries
+        if not self._all_ranks_ok(reason is None):
+            if rank == 0:
+                logger.info(f"[delta] v{version}: full sync ({reason})")
+            return False
+
+        error = None
+        if rank == 0:
+            try:
+                self._pause_rollout()
+                for b, tensors in enumerate(buckets):
+                    error = self._send_to_loader(tensors, str(version) if b == len(buckets) - 1 else None)
+                    if error is not None:
+                        break
+            except Exception as e:  # noqa: BLE001 - fall back to a full sync
+                logger.exception("Delta broadcast failed")
+                error = f"{type(e).__name__}: {e}"
+            if error is None:
+                logger.info(
+                    f"[delta] v{base}->v{version}: {len(buckets)} buckets, "
+                    f"{sum(t.numel() * t.element_size() for b in buckets for _, t in b)} B, {time.time() - start:.2f}s"
+                )
+            else:
+                logger.warning(f"[delta] v{base}->v{version} rejected, falling back to full sync: {error}")
+        del buckets
+        if not self._all_ranks_ok(error is None):
+            delta.discard()
+            return False
+        delta.commit(version)
+        return True
+
+    def _pause_rollout(self) -> None:
+        """Pause generation and flush caches on every engine (PP-src rank)."""
+        if self._rollout_paused:
+            return
+        logger.info("Pausing generation on all rollout nodes...")
+        ray.get(self._batch_request("/pause_generation"))
+        self._rollout_paused = True
+        for engine in self.rollout_engines.values():
+            ray.get(engine.flush_cache.remote())
+
+    def _delta_verify_due(self) -> bool:
+        delta = self._delta
+        if delta.verify_next:
+            return True
+        interval = self.args.delta_verify_interval
+        return interval > 0 and delta.deltas_since_verify >= interval
+
+    def _reseed_delta_after_full(self, verify: bool) -> None:
+        """After a full rollout sync: re-seed the engines' delta loaders and
+        the trainer snapshot (collective).
+
+        With ``verify`` the full sync re-sent a version that had been installed
+        as a delta; the loader then reports whether the live weights already
+        matched it.
+        """
+        error = None
+        if dist.get_rank() == 0:
+            meta = {"action": "reset", "version": self.weight_version}
+            error = self._send_to_loader([(META_NAME, encode_meta(meta, self.device))], None)
+        if not self._all_ranks_ok(error is None):
+            if dist.get_rank() == 0:
+                logger.error(f"[delta] disabled for this run: {error}")
+            self._delta.drop()
+            self._delta = None
+            return
+        if verify:
+            if dist.get_rank() == 0:
+                logger.info(f"[delta] v{self.weight_version}: verified against a full sync, 0 mismatches")
+            self._delta.verified()
+        else:
+            self._delta.reseed(self.weight_version)
+            self._rollout_group_rebuilt = False
+            if dist.get_rank() == 0:
+                logger.info(f"[delta] v{self.weight_version}: seeded by a full sync")
+
+    def _check_delta_loader_registered(self) -> str | None:
+        """Without the loader registered, SGLang would hand the delta messages
+        to ``model.load_weights`` instead (PP-src rank)."""
+        for rank, engine in self.rollout_engines.items():
+            try:
+                info = ray.get(engine.get_json.remote("/server_info"))
+            except Exception as e:  # noqa: BLE001 - reported to the caller
+                return f"engine {rank}: /server_info failed: {e}"
+            if LOADER_PATH not in (info.get("custom_weight_loader") or []):
+                return f"engine {rank} was not started with custom_weight_loader={LOADER_PATH}"
+            if info.get("dp_size", 1) != 1:
+                return f"engine {rank} uses dp_size={info.get('dp_size')}"
+        # registration alone is not enough: an SGLang without the Relax patch would pass the
+        # message to model.load_weights, so require the loader's own reply from every engine
+        ping = [(META_NAME, encode_meta({"action": "ping"}, self.device))]
+        errors = self._broadcast_to_loader(ping, None)
+        missing = [rank for rank in self.rollout_engines if PONG not in (errors.get(rank) or "")]
+        if missing:
+            return f"engines {missing} do not dispatch /update_weights_from_distributed to {LOADER_PATH}"
+        return None
+
+    def _send_to_loader(self, named_tensors: list[tuple[str, torch.Tensor]], weight_version: str | None) -> str | None:
+        """Broadcast one delta-loader message to every rollout engine (PP-src
+        rank).
+
+        Returns None when all engines succeeded, otherwise their errors.
+        """
+        errors = self._broadcast_to_loader(named_tensors, weight_version)
+        return "; ".join(f"engine {rank}: {e}" for rank, e in errors.items())[:4000] if errors else None
+
+    def _broadcast_to_loader(
+        self, named_tensors: list[tuple[str, torch.Tensor]], weight_version: str | None
+    ) -> dict[int, str]:
+        """Return ``{engine rank: error}`` for the engines that failed the
+        call."""
+        while not ray.get(self.lock.acquire.remote()):
+            time.sleep(0.1)
+        try:
+            payload = {
+                "names": [name for name, _ in named_tensors],
+                "dtypes": [str(t.dtype).replace("torch.", "") for _, t in named_tensors],
+                "shapes": [list(t.shape) for _, t in named_tensors],
+                "group_name": self._group_name,
+                "weight_version": weight_version,
+                "flush_cache": False,
+                "load_format": LOADER_PATH,
+            }
+            futures = self._batch_request("/update_weights_from_distributed", payload)
+            handles = [dist.broadcast(t, 0, group=self._model_update_groups, async_op=True) for _, t in named_tensors]
+            for handle in handles:
+                handle.wait()
+            errors = {}
+            for rank, future in zip(self.rollout_engines, futures):
+                try:
+                    ray.get(future)
+                except Exception as e:  # noqa: BLE001 - reported to the caller
+                    errors[rank] = str(e)
+            return errors
+        finally:
+            ray.get(self.lock.release.remote())
+
+    @staticmethod
+    def _all_ranks_ok(ok: bool) -> bool:
+        flag = torch.tensor([0 if ok else 1], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        return not bool(flag.item())
 
     def _update_weight_from_distributed(
         self,
@@ -995,6 +1238,13 @@ class DeviceDirectBackend(CommBackend):
 
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
+        if self._full_meta is not None:
+            # delta sync enabled: full buckets go through the delta loader, which records that a
+            # full sync is in progress (and compares against the live weights when verifying)
+            converted_named_tensors = [
+                (META_NAME, encode_meta(self._full_meta, self.device)),
+                *converted_named_tensors,
+            ]
         # Prepare payload for weight update
         weight_payload = {
             "names": [name for name, _ in converted_named_tensors],
@@ -1004,6 +1254,8 @@ class DeviceDirectBackend(CommBackend):
             "weight_version": str(self.weight_version),
             "flush_cache": False,
         }
+        if self._full_meta is not None:
+            weight_payload["load_format"] = LOADER_PATH
         # Send weight update to all rollout nodes via Ray actors
         futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
@@ -1331,6 +1583,12 @@ class RolloutEngine:
         response = requests.get(f"{self.base_url}/health_generate", timeout=timeout)
         response.raise_for_status()
         return True
+
+    def get_json(self, endpoint: str, timeout: float = 30.0) -> Any:
+        """Send a GET to the rollout node and return the parsed JSON."""
+        response = requests.get(f"{self.base_url}/{endpoint.lstrip('/')}", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
 
     def make_request(self, endpoint: str, payload: Optional[Dict] = None) -> Any:
         """Send a synchronous HTTP POST to the rollout node and return JSON.
