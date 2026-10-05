@@ -15,6 +15,7 @@ Features:
 
 import asyncio
 import logging
+import os
 import re
 import socket
 import time
@@ -36,7 +37,14 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
-from relax.utils.delta_wire import LOADER_PATH, META_NAME, PONG, encode_meta
+from relax.utils.delta_wire import (
+    LOADER_PATH,
+    META_NAME,
+    PONG,
+    TENSOR_PATH_SAFE,
+    encode_meta,
+    encode_named_cpu_tensors,
+)
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -232,6 +240,19 @@ class DeviceDirectBackend(CommBackend):
                 self._delta = SparseDeltaSync(args, model, self._bridge_converter)
             else:
                 logger.warning(f"--delta-weight-sync disabled: {reason}; rollout updates stay full.")
+        # --delta-transport shared_fs: versions travel as packages in a shared directory
+        # (relax.utils.delta_store); the NCCL group then only carries the loader ping.
+        self._store_dir = None
+        self._store_epoch = None  # claimed by the PP-src rank of PP stage 0 (global rank 0)
+        self._package: Optional[Any] = None  # PackageWriter of the version being sent (rank 0)
+        self._versions_since_full_package = 0
+        if self._delta is not None and getattr(args, "delta_transport", "nccl") == "shared_fs":
+            self._store_dir = args.delta_store_dir
+            if dist.get_rank() == 0:
+                from relax.utils.delta_store import claim_epoch
+
+                self._store_epoch = claim_epoch(self._store_dir)
+                logger.info(f"[delta] shared store {self._store_dir}, epoch {self._store_epoch}")
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -723,12 +744,15 @@ class DeviceDirectBackend(CommBackend):
                     self._batch_request("/continue_generation")
                     self._rollout_paused = False
                 dist.barrier(group=get_gloo_group())
+                self._write_anchor_package()
                 if rollout_only:
                     device_module.empty_cache()
                     return
                 actor_fwd_only = True
             else:
                 self._full_meta = {"action": "full", "version": self.weight_version, "verify": verify}
+                if self._store_dir is not None and dist.get_rank() == 0:
+                    self._new_package("full", self.weight_version)
 
         if not actor_fwd_only:
             if dist.get_rank() == 0 and not self._rollout_paused:
@@ -919,11 +943,19 @@ class DeviceDirectBackend(CommBackend):
         error = None
         if rank == 0:
             try:
-                self._pause_rollout()
-                for b, tensors in enumerate(buckets):
-                    error = self._send_to_loader(tensors, str(version) if b == len(buckets) - 1 else None)
-                    if error is not None:
-                        break
+                if self._store_dir is not None:
+                    # written while the rollout keeps generating; only the install runs paused
+                    package = self._new_package("delta", version, base)
+                    for tensors in buckets:
+                        package.add_bucket(tensors)
+                    self._pause_rollout()
+                    error = self._install_package(str(version))
+                else:
+                    self._pause_rollout()
+                    for b, tensors in enumerate(buckets):
+                        error = self._send_to_loader(tensors, str(version) if b == len(buckets) - 1 else None)
+                        if error is not None:
+                            break
             except Exception as e:  # noqa: BLE001 - fall back to a full sync
                 logger.exception("Delta broadcast failed")
                 error = f"{type(e).__name__}: {e}"
@@ -937,9 +969,115 @@ class DeviceDirectBackend(CommBackend):
         del buckets
         if not self._all_ranks_ok(error is None):
             delta.discard()
+            self._finish_package(publish=False)
             return False
         delta.commit(version)
+        self._finish_package(publish=True)
+        self._versions_since_full_package += 1
         return True
+
+    # ------------------------------------------------------------ shared-storage transport
+
+    def _new_package(self, kind: str, version: int, base: int | None = None):
+        """Start the package of ``version`` (global rank 0)."""
+        from relax.utils.delta_store import PackageWriter
+
+        self._package = PackageWriter(self._store_dir, self._store_epoch, version, kind, base)
+        return self._package
+
+    def _install_package(self, weight_version: str | None) -> str | None:
+        """Ask every engine to install the package being written (global rank
+        0).
+
+        Engines read it from its temporary path; it is published only once all
+        of them committed it.
+        """
+        package = self._package
+        meta = {
+            "action": "install",
+            "kind": package.kind,
+            "epoch": package.epoch,
+            "version": package.version,
+            "path": package.seal(),
+        }
+        return self._send_control(meta, weight_version)
+
+    def _send_control(self, meta: dict, weight_version: str | None) -> str | None:
+        """Send a metadata-only loader message (global rank 0): over
+        ``/update_weights_from_tensor`` with the shared-storage transport (no
+        NCCL), else over the NCCL group like the delta buckets."""
+        if self._store_dir is None:
+            return self._send_to_loader([(META_NAME, encode_meta(meta, self.device))], weight_version)
+        payload = {
+            # one copy per TP rank of the engine; a CPU tensor pickles by value
+            "serialized_named_tensors": [encode_named_cpu_tensors([(META_NAME, encode_meta(meta, "cpu"))])]
+            * self.args.rollout_num_gpus_per_engine,
+            "load_format": LOADER_PATH,
+            "flush_cache": False,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        errors = {}
+        for rank, future in zip(self.rollout_engines, self._batch_request("/update_weights_from_tensor", payload)):
+            try:
+                ray.get(future)
+            except Exception as e:  # noqa: BLE001 - reported to the caller
+                errors[rank] = str(e)
+        return "; ".join(f"engine {rank}: {e}" for rank, e in errors.items())[:4000] if errors else None
+
+    def _finish_package(self, publish: bool) -> None:
+        """Publish (or drop) the package being written and prune the store
+        (global rank 0)."""
+        package, self._package = self._package, None
+        if package is None:
+            return
+        if not publish:
+            package.abort()
+            return
+        from relax.utils.delta_store import prune
+
+        published = package.publish()
+        removed = prune(self._store_dir, self._store_epoch)
+        logger.info(
+            f"[delta] published {os.path.relpath(published.path, self._store_dir)} ({package.nbytes} B)"
+            + (f", pruned {len(removed)}" if removed else "")
+        )
+
+    def _write_anchor_package(self) -> None:
+        """Every ``--delta-anchor-interval`` versions, export the current
+        weights into a full package that is only written to the store (so
+        offline consumers can start from it and old packages can be pruned);
+        the engines already hold this version (collective, generation
+        running)."""
+        interval = self.args.delta_anchor_interval
+        if self._store_dir is None or interval <= 0 or self._versions_since_full_package < interval:
+            return
+        if self._is_pp_src_rank and dist.get_rank() == 0:
+            self._new_package("full", self.weight_version)
+        self._full_meta = {"action": "full", "version": self.weight_version, "verify": False}
+        try:
+            self._export_full_for_rollout()
+        finally:
+            self._full_meta = None
+        if dist.get_rank() == 0:
+            self._finish_package(publish=True)
+        self._versions_since_full_package = 0
+
+    def _export_full_for_rollout(self) -> None:
+        """Gather and convert every parameter into rollout buckets, which go to
+        the package being written (collective)."""
+        converted, origin, buffer_size = [], [], 0
+        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
+            if ".experts." in name:
+                continue
+            buffer_size = self._update_weight_from_distributed(
+                name, param, converted, origin, buffer_size, rollout_only=True, actor_fwd_only=False
+            )
+        if converted:
+            self._update_bucket_weights_from_distributed(converted)
+        dist.barrier(group=get_gloo_group())
+        self._run_expert_pass(rollout_only=True, actor_fwd_only=False, pbar=None)
+        dist.barrier(group=get_gloo_group())
 
     def _pause_rollout(self) -> None:
         """Pause generation and flush caches on every engine (PP-src rank)."""
@@ -966,10 +1104,25 @@ class DeviceDirectBackend(CommBackend):
         as a delta; the loader then reports whether the live weights already
         matched it.
         """
+        if self._store_dir is not None:
+            # the full version was written to a package instead of being broadcast: install it now
+            error = self._install_package(str(self.weight_version)) if dist.get_rank() == 0 else None
+            if not self._all_ranks_ok(error is None):
+                if dist.get_rank() == 0:
+                    self._finish_package(publish=False)
+                    self._batch_request("/continue_generation")
+                    self._rollout_paused = False
+                raise RuntimeError(
+                    f"[delta] installing the full package of v{self.weight_version} failed"
+                    + (f": {error}" if error else " (see global rank 0)")
+                )
+            if dist.get_rank() == 0:
+                self._finish_package(publish=True)
+            self._versions_since_full_package = 0
         error = None
         if dist.get_rank() == 0:
-            meta = {"action": "reset", "version": self.weight_version}
-            error = self._send_to_loader([(META_NAME, encode_meta(meta, self.device))], None)
+            meta = {"action": "reset", "version": self.weight_version, "epoch": self._store_epoch}
+            error = self._send_control(meta, None)
         if not self._all_ranks_ok(error is None):
             if dist.get_rank() == 0:
                 logger.error(f"[delta] disabled for this run: {error}")
@@ -1005,6 +1158,12 @@ class DeviceDirectBackend(CommBackend):
         missing = [rank for rank in self.rollout_engines if PONG not in (errors.get(rank) or "")]
         if missing:
             return f"engines {missing} do not dispatch /update_weights_from_distributed to {LOADER_PATH}"
+        if self._store_dir is not None:
+            unsafe = [rank for rank in self.rollout_engines if TENSOR_PATH_SAFE not in errors[rank]]
+            if unsafe:
+                return (
+                    f"engines {unsafe}: /update_weights_from_tensor lacks the Relax patch (loader errors would crash)"
+                )
         return None
 
     def _send_to_loader(self, named_tensors: list[tuple[str, torch.Tensor]], weight_version: str | None) -> str | None:
@@ -1235,6 +1394,12 @@ class DeviceDirectBackend(CommBackend):
         broadcasts. This function blocks until all broadcasts and remote
         updates complete.
         """
+        if self._package is not None:
+            # shared-storage transport: the full version is written to its package instead
+            self._package.add_bucket([(META_NAME, encode_meta(self._full_meta, "cpu")), *converted_named_tensors])
+            if pbar is not None:
+                pbar.update(1)
+            return
 
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)

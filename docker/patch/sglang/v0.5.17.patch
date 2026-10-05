@@ -2172,6 +2172,20 @@ index ecbfa7a..3b5d951 100644
              return True, "Succeeded to update parameter online."
  
          except Exception as e:
+@@ -345,7 +349,12 @@ class WeightUpdater:
+             _model_load_weights_direct(self.get_model(), named_tensors)
+         elif load_format in self.custom_weight_loaders:
+             custom_loader = dynamic_import(load_format)
+-            custom_loader(self.get_model(), named_tensors)
++            try:
++                custom_loader(self.get_model(), named_tensors)
++            except Exception as e:
++                # report the failure instead of leaving the scheduler (as the distributed path does)
++                logger.error(f"Custom weight loader {load_format} failed: {e}")
++                return False, f"Custom weight loader failed: {e}"
+         elif load_format is None:
+             self.get_model().load_weights(named_tensors)
+         else:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
 index 08c47b99..06a222fe 100644
 --- a/python/sglang/srt/models/qwen3_5.py

@@ -33,6 +33,7 @@ from relax.utils.delta_wire import (
     IDX_NAME,
     META_NAME,
     PONG,
+    TENSOR_PATH_SAFE,
     UNSUPPORTED,
     VAL_NAME,
     VERIFY_MISMATCH,
@@ -47,6 +48,7 @@ CHUNK_BYTES = 512 << 20
 
 _STATE: dict = {
     "version": None,  # last committed weight version
+    "epoch": None,  # store epoch of the last full package installed (shared-storage transport)
     "pending": None,  # (version, next_bucket, n_buckets) while a delta version is being installed
     "must_full": True,
     "error": "not seeded",
@@ -75,11 +77,59 @@ def load_weights(model: torch.nn.Module, named_tensors) -> None:
         _full(model, meta, rest)
     elif action == "reset":
         _reset(model, meta)
+    elif action == "install":
+        _install(model, meta)
     elif action == "ping":
         # the trainer expects this exact failure to prove the message reached this loader
-        _agree(PONG)
+        _agree(f"{PONG} {TENSOR_PATH_SAFE}" if _tensor_path_reports_errors() else PONG)
     else:
         _agree(f"unknown action {action!r}")
+
+
+# ---------------------------------------------------------------- install (shared storage)
+
+
+def _install(model: torch.nn.Module, meta: dict) -> None:
+    """Install a published version package (:mod:`relax.utils.delta_store`) by
+    replaying its buckets; every TP rank reads the package itself.
+
+    A full package is followed by a ``reset`` message, as over NCCL.
+    """
+    from relax.utils.delta_store import FULL, read_buckets
+
+    error = None
+    if meta["kind"] != FULL and _STATE["epoch"] != meta["epoch"]:
+        error = f"epoch mismatch: committed epoch {_STATE['epoch']}, package epoch {meta['epoch']}"
+    _agree(error, on_error=_fail)
+    buckets = read_buckets(meta["path"], next(model.parameters()).device)
+    while True:
+        bucket = None
+        try:
+            bucket = next(buckets, None)
+        except Exception as exc:  # noqa: BLE001 - unreadable package; reported below
+            error = f"reading {meta['path']}: {type(exc).__name__}: {exc}"
+        _agree(error, on_error=_fail)
+        if bucket is None:
+            break
+        bucket_meta, rest = decode_meta(bucket[0][1]), bucket[1:]
+        if bucket_meta["action"] == "delta":
+            _delta(model, bucket_meta, dict(rest))
+        else:
+            _full(model, bucket_meta, rest)
+
+
+def _tensor_path_reports_errors() -> bool:
+    """``/update_weights_from_tensor`` turns loader exceptions into a failed
+    call only with the Relax SGLang patch; unpatched, they stop the
+    scheduler."""
+    import inspect
+
+    try:
+        from sglang.srt.model_executor.model_runner_components.weight_updater import WeightUpdater
+
+        return "Custom weight loader failed" in inspect.getsource(WeightUpdater.update_weights_from_tensor)
+    except Exception:  # noqa: BLE001 - unknown SGLang layout: treat as unpatched
+        return False
 
 
 # ---------------------------------------------------------------- delta
@@ -280,6 +330,7 @@ def _reset(model: torch.nn.Module, meta: dict) -> None:
         mismatched, _STATE["verify"] = _STATE["verify"], {}
         _STATE.update(
             version=meta["version"],
+            epoch=meta.get("epoch"),
             pending=None,
             known_nan=set(_nan_params(model)),
             must_full=bool(reasons),

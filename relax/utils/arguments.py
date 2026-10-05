@@ -1022,6 +1022,36 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="With --delta-weight-sync: send a full sync when the delta payload exceeds this fraction of it.",
             )
             parser.add_argument(
+                "--delta-transport",
+                choices=["nccl", "shared_fs"],
+                default="nccl",
+                help=(
+                    "With --delta-weight-sync: how versions reach the rollout engines. 'nccl' broadcasts them over "
+                    "the weight-update group; 'shared_fs' publishes each version as a package under "
+                    "--delta-store-dir, which every engine reads, and which can be consumed offline "
+                    "(python -m relax.tools.delta_consume)."
+                ),
+            )
+            parser.add_argument(
+                "--delta-store-dir",
+                type=str,
+                default=None,
+                help=(
+                    "With --delta-transport shared_fs: a directory on storage mounted by the trainer and every "
+                    "rollout node, used by this training job only."
+                ),
+            )
+            parser.add_argument(
+                "--delta-anchor-interval",
+                type=int,
+                default=50,
+                help=(
+                    "With --delta-transport shared_fs: also write a full package after this many versions without "
+                    "one, so offline consumers can start from it and older packages can be removed (the last two "
+                    "full packages and the versions after them are kept). 0 disables anchors."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

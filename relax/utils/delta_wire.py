@@ -35,6 +35,8 @@ UNSUPPORTED = "unsupported"
 VERIFY_MISMATCH = "verify_mismatch"
 # reply of the loader to a ping message (sent as an error so it cannot come from model.load_weights)
 PONG = "delta loader pong"
+# appended to PONG when /update_weights_from_tensor reports loader errors instead of crashing
+TENSOR_PATH_SAFE = "tensor-path-safe"
 VAL_ALIGN = 8
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
@@ -62,6 +64,32 @@ def encode_meta(meta: dict, device: torch.device | str) -> torch.Tensor:
 
 def decode_meta(t: torch.Tensor) -> dict:
     return json.loads(t.cpu().numpy().tobytes().decode())
+
+
+def encode_named_cpu_tensors(named_tensors: list[tuple[str, torch.Tensor]]) -> str:
+    """Serialize 1-D uint8 tensors (loader metadata) for
+    ``/update_weights_from_tensor``: base64 of a plain pickle that rebuilds
+    each tensor with ``torch.frombuffer``. The bytes travel by value (no CUDA
+    IPC handle, so the engine may run on another node), and the pickle does
+    not reference ``torch.storage._load_from_bytes``, which Megatron replaces
+    with a function SGLang's restricted unpickler rejects."""
+    import base64
+    import functools
+    import io
+    import pickle
+
+    class _Pickler(pickle.Pickler):
+        def reducer_override(self, obj):
+            if isinstance(obj, torch.Tensor):
+                assert obj.dim() == 1 and obj.dtype == torch.uint8, (obj.shape, obj.dtype)
+                return functools.partial(torch.frombuffer, dtype=torch.uint8), (
+                    bytearray(obj.cpu().numpy().tobytes()),
+                )
+            return NotImplemented
+
+    buf = io.BytesIO()
+    _Pickler(buf).dump(list(named_tensors))
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def payload_sha256(idx: torch.Tensor, val: torch.Tensor) -> str:

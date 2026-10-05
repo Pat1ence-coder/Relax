@@ -86,6 +86,8 @@ def unsupported_reason(args, quantization_config) -> str | None:
         return "LoRA is not supported"
     if quantization_config:
         return "quantized rollout weights are not supported"
+    if getattr(args, "delta_transport", "nccl") == "shared_fs" and not getattr(args, "delta_store_dir", None):
+        return "--delta-transport shared_fs requires --delta-store-dir"
     return None
 
 
