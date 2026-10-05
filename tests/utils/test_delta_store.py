@@ -243,7 +243,10 @@ def test_delta_loader_prefetches_sealed_package_before_install(tmp_path, monkeyp
     monkeypatch.setattr(delta_store, "read_buckets", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read")))
     install(model, p2)
     assert_bitwise(model, s2)
-    w2.publish()
+    (marker,) = [n for n in os.listdir(p2.path) if n.startswith(delta_store.READY)]
+    assert len(marker) == len(delta_store.READY) + 32  # uuid4 hex only, no host name or pid
+    published = w2.publish()
+    assert not [n for n in os.listdir(published.path) if n.startswith(delta_store.READY)]  # markers not published
     # the next one is prefetched too (chain), and a package that is not the prefetched one is read normally
     monkeypatch.setattr(delta_store, "read_buckets", real_read)
     s3 = perturb(s2, 3)

@@ -22,7 +22,6 @@ and the offline consumer.
 import json
 import os
 import shutil
-import socket
 import uuid
 from dataclasses import dataclass
 
@@ -32,7 +31,7 @@ from safetensors.torch import load, save_file
 
 MANIFEST = "manifest.json"
 HEAD = "HEAD"
-READY = ".ready-"  # marker a consumer leaves in a sealed package once it has read it (prefetch)
+READY = ".ready-"  # marker a consumer leaves in a sealed package once it has read it (prefetch); removed on publish
 FULL, DELTA = "full", "delta"
 KEEP_FULL = 2  # retention: the latest KEEP_FULL full packages and everything after the oldest of them
 
@@ -125,6 +124,9 @@ class PackageWriter:
 
     def publish(self) -> Package:
         self.seal()
+        for name in os.listdir(self.tmp):
+            if name.startswith(READY):
+                os.remove(os.path.join(self.tmp, name))
         final = os.path.join(_epoch_dir(self.store, self.epoch), self.name)
         os.rename(self.tmp, final)  # fails if a package of that name already exists
         _fsync_dir(os.path.dirname(final))
@@ -174,7 +176,8 @@ def sealed_package(epoch_dir: str, version: int, kind: str) -> str | None:
 
 
 def mark_ready(path: str) -> None:
-    open(os.path.join(path, f"{READY}{socket.gethostname()}-{os.getpid()}"), "w").close()
+    # random name: unique per consumer without recording which host or process it is
+    open(os.path.join(path, f"{READY}{uuid.uuid4().hex}"), "w").close()
 
 
 def count_ready(path: str) -> int:
