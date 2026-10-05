@@ -22,6 +22,9 @@ the call as failed (HTTP 400) without leaving the scheduler; the trainer then
 falls back to a full sync in the same pause window.
 """
 
+import os
+import threading
+import time
 from contextlib import contextmanager
 
 import torch
@@ -42,9 +45,15 @@ from relax.utils.delta_wire import (
     int_view,
     payload_sha256,
 )
+from relax.utils.logging_utils import get_logger
 
+
+logger = get_logger(__name__)
 
 CHUNK_BYTES = 512 << 20
+PREFETCH_MAX_BYTES = 2 << 30  # larger delta packages are read inside the pause
+PREFETCH_POLL_S = 0.1
+PREFETCH_GIVE_UP_S = 1800.0
 
 _STATE: dict = {
     "version": None,  # last committed weight version
@@ -55,7 +64,13 @@ _STATE: dict = {
     "storage_ptrs": None,  # data_ptrs of every parameter/buffer storage
     "known_nan": set(),  # params that legitimately hold NaN after the last full sync
     "verify": {},  # name -> mismatched elements found by the in-progress verify stream
+    "epoch_dir": None,  # store epoch directory of the last installed package (shared-storage transport)
 }
+
+# next delta package read ahead to CPU while the rollout still generates (shared-storage transport):
+# {"path": sealed package path, "buckets": [(bucket, payload sha256 or None), ...]}; guarded by _PREFETCH_LOCK
+_PREFETCH: dict = {"generation": 0, "path": None, "buckets": None}
+_PREFETCH_LOCK = threading.Lock()
 
 
 class MaskedCopyError(RuntimeError):
@@ -101,21 +116,93 @@ def _install(model: torch.nn.Module, meta: dict) -> None:
     if meta["kind"] != FULL and _STATE["epoch"] != meta["epoch"]:
         error = f"epoch mismatch: committed epoch {_STATE['epoch']}, package epoch {meta['epoch']}"
     _agree(error, on_error=_fail)
-    buckets = read_buckets(meta["path"], next(model.parameters()).device)
+    _STATE["epoch_dir"] = os.path.dirname(meta["path"].rstrip("/"))
+    device = next(model.parameters()).device
+    prefetched = _take_prefetch(meta["path"])
+    if prefetched is not None:
+        buckets = (([(n, t.to(device)) for n, t in bucket], sha) for bucket, sha in prefetched)
+    else:
+        buckets = ((bucket, None) for bucket in read_buckets(meta["path"], device))
     while True:
-        bucket = None
+        item = None
         try:
-            bucket = next(buckets, None)
+            item = next(buckets, None)
         except Exception as exc:  # noqa: BLE001 - unreadable package; reported below
             error = f"reading {meta['path']}: {type(exc).__name__}: {exc}"
         _agree(error, on_error=_fail)
-        if bucket is None:
+        if item is None:
             break
+        bucket, sha = item
         bucket_meta, rest = decode_meta(bucket[0][1]), bucket[1:]
         if bucket_meta["action"] == "delta":
-            _delta(model, bucket_meta, dict(rest))
+            _delta(model, bucket_meta, dict(rest), sha)
         else:
             _full(model, bucket_meta, rest)
+    if meta["kind"] != FULL:
+        _start_prefetch(meta["version"] + 1)  # a full package is followed by reset, which starts it
+
+
+def _start_prefetch(version: int) -> None:
+    """Read the delta package of ``version`` to CPU in the background as soon
+    as the trainer seals it, and verify its payloads, so that the install in
+    the pause only copies it to the GPU.
+
+    Leaves a ready marker in the package either way (the trainer waits for
+    them, bounded, before pausing). Best effort: any problem means the install
+    reads the package itself.
+    """
+    epoch_dir = _STATE["epoch_dir"]
+    if epoch_dir is None:
+        return
+    with _PREFETCH_LOCK:
+        _PREFETCH.update(generation=_PREFETCH["generation"] + 1, path=None, buckets=None)
+        generation = _PREFETCH["generation"]
+    threading.Thread(target=_prefetch, args=(epoch_dir, version, generation), name="dws-prefetch", daemon=True).start()
+
+
+def _prefetch(epoch_dir: str, version: int, generation: int) -> None:
+    from relax.utils.delta_store import DELTA, mark_ready, read_buckets, read_manifest, sealed_package
+
+    deadline = time.monotonic() + PREFETCH_GIVE_UP_S
+    path = None
+    while path is None:
+        if _PREFETCH["generation"] != generation or time.monotonic() > deadline:
+            return
+        try:
+            path = sealed_package(epoch_dir, version, DELTA)
+        except OSError:
+            path = None
+        if path is None:
+            time.sleep(PREFETCH_POLL_S)
+    try:
+        if sum(f["bytes"] for f in read_manifest(path)["files"]) <= PREFETCH_MAX_BYTES:
+            buckets = []
+            for bucket in read_buckets(path, "cpu"):
+                bucket_meta, rest = decode_meta(bucket[0][1]), dict(bucket[1:])
+                sha = None
+                if bucket_meta["action"] == "delta":
+                    sha = payload_sha256(
+                        rest[IDX_NAME][: bucket_meta["idx_len"]], rest[VAL_NAME][: bucket_meta["val_len"]]
+                    )
+                buckets.append((bucket, sha))
+            with _PREFETCH_LOCK:
+                if _PREFETCH["generation"] == generation:
+                    _PREFETCH.update(path=path, buckets=buckets)
+    except Exception as exc:  # noqa: BLE001 - the install reads the package itself
+        logger.warning(f"[delta] prefetch of {path} failed: {type(exc).__name__}: {exc}")
+    try:
+        mark_ready(path)
+    except OSError as exc:
+        logger.warning(f"[delta] cannot mark {path} ready: {exc}")
+
+
+def _take_prefetch(path: str) -> list | None:
+    """The prefetched buckets of ``path`` (consumed), or None."""
+    with _PREFETCH_LOCK:
+        hit = _PREFETCH["path"] is not None and os.path.realpath(_PREFETCH["path"]) == os.path.realpath(path)
+        buckets = _PREFETCH["buckets"] if hit else None
+        _PREFETCH.update(generation=_PREFETCH["generation"] + 1, path=None, buckets=None)
+    return buckets
 
 
 def _tensor_path_reports_errors() -> bool:
@@ -135,11 +222,12 @@ def _tensor_path_reports_errors() -> bool:
 # ---------------------------------------------------------------- delta
 
 
-def _delta(model: torch.nn.Module, meta: dict, tensors: dict) -> None:
+def _delta(model: torch.nn.Module, meta: dict, tensors: dict, sha: str | None = None) -> None:
+    """``sha``: payload SHA-256 already computed on the same bytes (prefetch)."""
     error = None
     try:
         idx, val = tensors[IDX_NAME], tensors[VAL_NAME]
-        error = _validate(meta, idx, val)
+        error = _validate(meta, idx, val, sha)
         if error is None:
             _apply(model, meta, idx, val)
     except Exception as exc:  # noqa: BLE001 - weights may be partially written; reported below
@@ -162,7 +250,7 @@ def _delta(model: torch.nn.Module, meta: dict, tensors: dict) -> None:
     _clear_mm_cache()
 
 
-def _validate(meta: dict, idx: torch.Tensor, val: torch.Tensor) -> str | None:
+def _validate(meta: dict, idx: torch.Tensor, val: torch.Tensor, sha: str | None = None) -> str | None:
     if _STATE["must_full"]:
         return f"must_full ({_STATE['error']})"
     version, base, bucket, n_buckets = meta["version"], meta["base_version"], meta["bucket"], meta["n_buckets"]
@@ -177,7 +265,7 @@ def _validate(meta: dict, idx: torch.Tensor, val: torch.Tensor) -> str | None:
     if n_idx > idx.numel() or n_val > val.numel():
         return "payload shorter than metadata"
     idx, val = idx[:n_idx], val[:n_val]
-    if payload_sha256(idx, val) != meta["sha256"]:
+    if (sha or payload_sha256(idx, val)) != meta["sha256"]:
         return "payload sha256 mismatch"
 
     i_end = v_end = 0
@@ -347,6 +435,8 @@ def _reset(model: torch.nn.Module, meta: dict) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
+    if error is None and meta.get("epoch") is not None:
+        _start_prefetch(meta["version"] + 1)
     _agree(error)
 
 

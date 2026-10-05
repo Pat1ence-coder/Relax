@@ -22,15 +22,17 @@ and the offline consumer.
 import json
 import os
 import shutil
+import socket
 import uuid
 from dataclasses import dataclass
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load, save_file
 
 
 MANIFEST = "manifest.json"
 HEAD = "HEAD"
+READY = ".ready-"  # marker a consumer leaves in a sealed package once it has read it (prefetch)
 FULL, DELTA = "full", "delta"
 KEEP_FULL = 2  # retention: the latest KEEP_FULL full packages and everything after the oldest of them
 
@@ -111,10 +113,12 @@ class PackageWriter:
             "base_version": self.base_version,
             "files": self.files,
         }
-        with open(os.path.join(self.tmp, MANIFEST), "w") as f:
+        tmp_manifest = os.path.join(self.tmp, f".{MANIFEST}")
+        with open(tmp_manifest, "w") as f:
             json.dump(manifest, f)
             f.flush()
             os.fsync(f.fileno())
+        os.rename(tmp_manifest, os.path.join(self.tmp, MANIFEST))  # a visible manifest is complete
         _fsync_dir(self.tmp)
         self.sealed = True
         return self.tmp
@@ -149,11 +153,32 @@ def read_buckets(path: str, device: str | torch.device = "cpu"):
     manifest = read_manifest(path)
     for entry in manifest["files"]:
         file = os.path.join(path, entry["name"])
-        size = os.path.getsize(file)
-        if size != entry["bytes"]:
-            raise ValueError(f"{file}: {size} bytes, manifest says {entry['bytes']}")
-        tensors = load_file(file, device=str(device))
+        # one sequential read: mmap (safetensors.load_file) faults pages in one by one, far slower on shared storage
+        with open(file, "rb") as f:
+            data = f.read()
+        if len(data) != entry["bytes"]:
+            raise ValueError(f"{file}: {len(data)} bytes, manifest says {entry['bytes']}")
+        tensors = {name: t.to(device) for name, t in load(data).items()}
+        del data
         yield sorted(tensors.items(), key=lambda kv: (not kv[0].startswith("__dws_meta__"), kv[0]))
+
+
+def sealed_package(epoch_dir: str, version: int, kind: str) -> str | None:
+    """Path of the sealed, not yet published package of ``version`` in
+    ``epoch_dir`` (written by the trainer), if any."""
+    prefix = f".tmp-v{version:06d}.{kind}-"
+    for name in os.listdir(epoch_dir):
+        if name.startswith(prefix) and os.path.exists(os.path.join(epoch_dir, name, MANIFEST)):
+            return os.path.join(epoch_dir, name)
+    return None
+
+
+def mark_ready(path: str) -> None:
+    open(os.path.join(path, f"{READY}{socket.gethostname()}-{os.getpid()}"), "w").close()
+
+
+def count_ready(path: str) -> int:
+    return sum(name.startswith(READY) for name in os.listdir(path))
 
 
 def list_packages(store: str) -> list[Package]:

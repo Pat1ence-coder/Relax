@@ -5,6 +5,7 @@ their installation through the SGLang delta loader and the offline consumer."""
 
 import json
 import os
+import time
 
 import pytest
 import torch
@@ -24,6 +25,13 @@ from tests.backends.sglang.test_delta_loader import (  # noqa: E402,F401
     packer,
     perturb,
 )
+
+
+@pytest.fixture(autouse=True)
+def stop_prefetch():
+    yield
+    with delta_loader._PREFETCH_LOCK:  # stops background prefetch threads left polling
+        delta_loader._PREFETCH.update(generation=delta_loader._PREFETCH["generation"] + 1, path=None, buckets=None)
 
 
 def write(store, epoch, version, kind, buckets, base=None):
@@ -200,3 +208,60 @@ def test_delta_consume_rebuilds_latest_version_offline(tmp_path):
     weights = delta_consume.rebuild(delta_store.plan(str(store), target=(1, 3)))
     for name, t in states[3].items():
         assert torch.equal(int_view(weights[name]), int_view(t)), name
+
+
+def sealed_delta(store, epoch, version, prev, nxt, corrupt=False):
+    w = delta_store.PackageWriter(str(store), epoch, version, delta_store.DELTA, version - 1)
+    for b in packer().pack(diff_entries(prev, nxt), version - 1, version, bucket_bytes=64):
+        w.add_bucket(b)
+    if corrupt:
+        file = os.path.join(w.tmp, "b00000.safetensors")
+        data = bytearray(open(file, "rb").read())
+        data[-1] ^= 1
+        open(file, "wb").write(bytes(data))
+    return w, delta_store.Package(epoch, version, delta_store.DELTA, version - 1, w.seal())
+
+
+def wait_ready(path, n=1, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while delta_store.count_ready(path) < n:
+        assert time.monotonic() < deadline, "prefetch did not finish"
+        time.sleep(0.02)
+
+
+def test_delta_loader_prefetches_sealed_package_before_install(tmp_path, monkeypatch):
+    """After each install the loader reads the next sealed delta package in the
+    background; the install of it then does not read the store."""
+    model = FakeModel()
+    s1 = model.hf_state()
+    epoch = delta_store.claim_epoch(str(tmp_path))
+    install(model, write(tmp_path, epoch, 1, delta_store.FULL, full_buckets(1, s1)))
+    s2 = perturb(s1, 2)
+    w2, p2 = sealed_delta(tmp_path, epoch, 2, s1, s2)
+    wait_ready(p2.path)
+    real_read = delta_store.read_buckets
+    monkeypatch.setattr(delta_store, "read_buckets", lambda *a, **k: (_ for _ in ()).throw(AssertionError("read")))
+    install(model, p2)
+    assert_bitwise(model, s2)
+    w2.publish()
+    # the next one is prefetched too (chain), and a package that is not the prefetched one is read normally
+    monkeypatch.setattr(delta_store, "read_buckets", real_read)
+    s3 = perturb(s2, 3)
+    _, p3 = sealed_delta(tmp_path, epoch, 3, s2, s3)
+    wait_ready(p3.path)
+    install(model, delta_store.Package(epoch, 3, delta_store.DELTA, 2, p3.path + "/"))
+    assert_bitwise(model, s3)
+    assert delta_loader._PREFETCH["buckets"] is None
+
+
+def test_delta_loader_rejects_corrupt_prefetched_package(tmp_path):
+    model = FakeModel()
+    s1 = model.hf_state()
+    epoch = delta_store.claim_epoch(str(tmp_path))
+    install(model, write(tmp_path, epoch, 1, delta_store.FULL, full_buckets(1, s1)))
+    _, p2 = sealed_delta(tmp_path, epoch, 2, s1, perturb(s1, 2), corrupt=True)
+    wait_ready(p2.path)
+    with pytest.raises(RuntimeError, match="sha256"):
+        install(model, p2)
+    assert_bitwise(model, s1)
+    assert delta_loader._STATE["must_full"]

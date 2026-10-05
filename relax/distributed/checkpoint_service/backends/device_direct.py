@@ -432,6 +432,7 @@ class DeviceDirectBackend(CommBackend):
                 f"Proceeding with {len(self.rollout_engines)} healthy rollout engine(s) after pruning {final_failed}"
             )
 
+    _PREFETCH_WAIT_S = 10.0  # shared-storage transport: bound on waiting for engines to read a package
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
 
@@ -941,6 +942,7 @@ class DeviceDirectBackend(CommBackend):
             return False
 
         error = None
+        prefetch_note = ""
         if rank == 0:
             try:
                 if self._store_dir is not None:
@@ -948,6 +950,7 @@ class DeviceDirectBackend(CommBackend):
                     package = self._new_package("delta", version, base)
                     for tensors in buckets:
                         package.add_bucket(tensors)
+                    prefetch_note = self._wait_prefetch(package.seal())
                     self._pause_rollout()
                     error = self._install_package(str(version))
                 else:
@@ -963,6 +966,7 @@ class DeviceDirectBackend(CommBackend):
                 logger.info(
                     f"[delta] v{base}->v{version}: {len(buckets)} buckets, "
                     f"{sum(t.numel() * t.element_size() for b in buckets for _, t in b)} B, {time.time() - start:.2f}s"
+                    f"{prefetch_note}"
                 )
             else:
                 logger.warning(f"[delta] v{base}->v{version} rejected, falling back to full sync: {error}")
@@ -1001,6 +1005,19 @@ class DeviceDirectBackend(CommBackend):
             "path": package.seal(),
         }
         return self._send_control(meta, weight_version)
+
+    def _wait_prefetch(self, path: str) -> str:
+        """Give the engines up to ``_PREFETCH_WAIT_S`` to read the sealed
+        package before the pause (global rank 0); returns a log note."""
+        from relax.utils.delta_store import count_ready
+
+        expected = len(self.rollout_engines) * self.args.rollout_num_gpus_per_engine
+        start = time.monotonic()
+        ready = count_ready(path)
+        while ready < expected and time.monotonic() - start < self._PREFETCH_WAIT_S:
+            time.sleep(0.02)
+            ready = count_ready(path)
+        return f", prefetched {ready}/{expected} in {time.monotonic() - start:.2f}s"
 
     def _send_control(self, meta: dict, weight_version: str | None) -> str | None:
         """Send a metadata-only loader message (global rank 0): over
