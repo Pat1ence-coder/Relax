@@ -74,6 +74,10 @@ def test_delta_tcp_sends_packages_in_chunks_and_keeps_only_the_latest(tmp_path):
     try:
         p1 = sealed(tmp_path, 1, [10_000, 1, 2500])
         assert server.send(p1, 1, 10.0) == 1
+        files = delta_store.read_manifest(p1)["files"]
+        frames = sum(-(-f["bytes"] // 1000) for f in files)  # 1000 B chunks
+        header = delta_tcp.HEADER.size + delta_tcp.DATA_HEADER.size
+        assert server.sent_bytes == sum(f["bytes"] for f in files) + frames * header
         got = spool / os.path.basename(p1)
         assert same_files(p1, str(got)) and (got / delta_store.MANIFEST).exists()
         p2 = sealed(tmp_path, 2, [4000])

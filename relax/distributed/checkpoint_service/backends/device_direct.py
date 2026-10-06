@@ -249,6 +249,8 @@ class DeviceDirectBackend(CommBackend):
         self._package: Optional[Any] = None  # PackageWriter of the version being sent (rank 0)
         self._versions_since_full_package = 0
         self._tcp_server: Optional[Any] = None  # PackageServer (rank 0, tcp transport)
+        # bytes the current rollout sync sent, per link (see update_weights_for_rollout)
+        self._sent = {"export": 0, "distribution": 0, "store_write": 0}
         if self._delta is not None and getattr(args, "delta_transport", "nccl") in ("shared_fs", "tcp"):
             self._store_dir = args.delta_store_dir
             if dist.get_rank() == 0:
@@ -677,6 +679,30 @@ class DeviceDirectBackend(CommBackend):
 
     @torch.no_grad()
     def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
+        """Update weights used by rollout nodes; global rank 0 then logs the
+        bytes the rollout sync sent.
+
+        ``export``: trainer-side communication added for the sync (TP all-
+        gather of full weights, gather of delta entries to rank 0);
+        ``distribution``: bytes sent to the rollout engines (NCCL broadcast
+        per receiving rank, package bytes per reading TP rank on shared
+        storage, bytes sent by the TCP server); ``store_write``: package
+        bytes written to shared storage. HTTP control requests and the
+        actor_fwd sync are not counted.
+        """
+        self._sent = {"export": 0, "distribution": 0, "store_write": 0}
+        tcp_before = self._tcp_server.sent_bytes if self._tcp_server is not None else 0
+        self._update_weights_for_rollout(rollout_only, actor_fwd_only)
+        if dist.get_rank() == 0 and not actor_fwd_only:
+            if self._tcp_server is not None:
+                self._sent["distribution"] += self._tcp_server.sent_bytes - tcp_before
+            sent = " ".join(f"{k}={v}" for k, v in self._sent.items())
+            logger.info(f"[weight-sync] v{self.weight_version} sent bytes: {sent}")
+
+    def _rollout_receivers(self) -> int:
+        return len(self.rollout_engines) * self.args.rollout_num_gpus_per_engine
+
+    def _update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights used by rollout nodes.
 
         Sequence: pause rollout generation, flush caches, gather and broadcast
@@ -935,6 +961,8 @@ class DeviceDirectBackend(CommBackend):
         try:
             merged = delta.gather_to_rank0(entries)
             if rank == 0:
+                self._sent["export"] += delta.received_bytes
+            if rank == 0:
                 payload = delta.payload_bytes(merged)
                 if payload > self.args.delta_max_payload_ratio * delta.total_bytes:
                     reason = f"payload {payload} B exceeds {self.args.delta_max_payload_ratio} of full"
@@ -1010,6 +1038,7 @@ class DeviceDirectBackend(CommBackend):
         path = package.seal()
         if self._tcp_server is None:
             meta["path"] = path  # over tcp each engine finds the package in its own spool
+            self._sent["distribution"] += package.nbytes * self._rollout_receivers()  # every TP rank reads it
         return self._send_control(meta, weight_version)
 
     def _wait_prefetch(self, path: str) -> str:
@@ -1025,7 +1054,7 @@ class DeviceDirectBackend(CommBackend):
             return f", sent to {acked}/{len(self.rollout_engines)} engines in {time.monotonic() - start:.2f}s"
         from relax.utils.delta_store import count_ready
 
-        expected = len(self.rollout_engines) * self.args.rollout_num_gpus_per_engine
+        expected = self._rollout_receivers()
         ready = count_ready(path)
         while ready < expected and time.monotonic() - start < self._PREFETCH_WAIT_S:
             time.sleep(0.02)
@@ -1061,6 +1090,8 @@ class DeviceDirectBackend(CommBackend):
         package, self._package = self._package, None
         if package is None:
             return
+        if self._tcp_server is None:
+            self._sent["store_write"] += package.nbytes  # over tcp the store is on the trainer node
         if not publish:
             package.abort()
             return
@@ -1233,6 +1264,9 @@ class DeviceDirectBackend(CommBackend):
             }
             futures = self._batch_request("/update_weights_from_distributed", payload)
             handles = [dist.broadcast(t, 0, group=self._model_update_groups, async_op=True) for _, t in named_tensors]
+            self._sent["distribution"] += sum(t.numel() * t.element_size() for _, t in named_tensors) * (
+                self._rollout_receivers()
+            )
             for handle in handles:
                 handle.wait()
             errors = {}
@@ -1266,10 +1300,19 @@ class DeviceDirectBackend(CommBackend):
 
         Returns updated buffer size on the source rank, otherwise None.
         """
+        local_numel = param.numel()
         param = self._megatron.all_gather_param(self.args, name, param)
         if not self._is_pp_src_rank:
             return
-
+        if dist.get_rank() == 0 and param.numel() > local_numel:
+            # each TP group sends every shard to the other TP ranks: full size x (tp - 1), once per DP replica
+            mpu = self._megatron.mpu
+            self._sent["export"] += (
+                param.numel()
+                * param.element_size()
+                * (mpu.get_tensor_model_parallel_world_size() - 1)
+                * mpu.get_data_parallel_world_size()
+            )
         param_size = param.numel() * param.element_size()
         if buffer_size + param_size > self.args.update_weight_buffer_size:
             if converted_named_tensors or origin_named_tensors:
@@ -1467,6 +1510,9 @@ class DeviceDirectBackend(CommBackend):
         handles = []
         for _, param in converted_named_tensors:
             handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
+        self._sent["distribution"] += sum(p.numel() * p.element_size() for _, p in converted_named_tensors) * (
+            self._rollout_receivers()
+        )
         for handle in handles:
             handle.wait()
         ray.get(futures)  # Ensure remote update completes

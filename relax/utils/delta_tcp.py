@@ -87,6 +87,7 @@ class PackageServer:
         self._path: str | None = None
         self._gen = 0  # bumped by every send start and end; transfers of an older generation stop
         self._acks: set[str] = set()
+        self.sent_bytes = 0  # DATA frame bytes sent to all receivers (headers included), for byte accounting
         threading.Thread(target=self._accept, name="dws-tcp-accept", daemon=True).start()
 
     def send(self, path: str, receivers: int, timeout: float) -> int:
@@ -165,6 +166,8 @@ class PackageServer:
                             raise ConnectionError(f"expected CREDIT, got frame type {kind}")
                         credit += json.loads(payload)["bytes"]
                     send_frame(conn, DATA, DATA_HEADER.pack(i, offset), chunk)
+                    with self._cond:
+                        self.sent_bytes += HEADER.size + DATA_HEADER.size + len(chunk)
                     credit -= len(chunk)
                     offset += len(chunk)
         return credit, True

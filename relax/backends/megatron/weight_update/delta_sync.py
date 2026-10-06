@@ -286,6 +286,7 @@ class SparseDeltaSync:
             return None
 
         merged: dict[str, list] = {}
+        self.received_bytes = 0  # idx + val bytes received from the other ranks (byte accounting)
         for src in range(world):
             if src == 0:
                 received = entries
@@ -299,6 +300,7 @@ class SparseDeltaSync:
                     val = torch.empty(n_val, dtype=torch.uint8, device=self.device)
                     dist.recv(idx, src=src, group=dist.group.WORLD)
                     dist.recv(val, src=src, group=dist.group.WORLD)
+                    self.received_bytes += idx.numel() * idx.element_size() + val.numel()
                     i0 = v0 = 0
                     for (name, shape, _, n), dtype in zip(metas[src], dtypes):
                         nbytes = n * dtype.itemsize
