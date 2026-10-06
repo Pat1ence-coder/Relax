@@ -1023,14 +1023,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--delta-transport",
-                choices=["nccl", "shared_fs"],
+                choices=["nccl", "shared_fs", "tcp"],
                 default="nccl",
                 help=(
                     "With --delta-weight-sync: how versions reach the rollout engines. 'nccl' broadcasts them over "
                     "the weight-update group; 'shared_fs' publishes each version as a package under "
                     "--delta-store-dir, which every engine reads, and which can be consumed offline "
-                    "(python -m relax.tools.delta_consume)."
+                    "(python -m relax.tools.delta_consume); 'tcp' writes the same packages to --delta-store-dir "
+                    "on the trainer node and streams them to every engine over one plain (unauthenticated) TCP "
+                    "connection per engine, for trusted internal networks."
                 ),
+            )
+            parser.add_argument(
+                "--delta-tcp-port",
+                type=int,
+                default=0,
+                help="With --delta-transport tcp: port of the trainer's package server (0: any free port).",
             )
             parser.add_argument(
                 "--delta-store-dir",
@@ -1038,7 +1046,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "With --delta-transport shared_fs: a directory on storage mounted by the trainer and every "
-                    "rollout node, used by this training job only."
+                    "rollout node, used by this training job only. With tcp: a directory on the trainer node."
                 ),
             )
             parser.add_argument(
@@ -1046,7 +1054,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=50,
                 help=(
-                    "With --delta-transport shared_fs: also write a full package after this many versions without "
+                    "With --delta-transport shared_fs or tcp: also write a full package after this many versions without "
                     "one, so offline consumers can start from it and older packages can be removed (the last two "
                     "full packages and the versions after them are kept). 0 disables anchors."
                 ),

@@ -72,6 +72,9 @@ _STATE: dict = {
 _PREFETCH: dict = {"generation": 0, "path": None, "buckets": None}
 _PREFETCH_LOCK = threading.Lock()
 
+# tcp transport: this engine's receiver process (TP rank 0 only) and the trainer address it receives from
+_RECEIVER: dict = {"address": None, "process": None}
+
 
 class MaskedCopyError(RuntimeError):
     pass
@@ -95,10 +98,57 @@ def load_weights(model: torch.nn.Module, named_tensors) -> None:
     elif action == "install":
         _install(model, meta)
     elif action == "ping":
+        if meta.get("tcp"):
+            _connect(meta["tcp"])
         # the trainer expects this exact failure to prove the message reached this loader
         _agree(f"{PONG} {TENSOR_PATH_SAFE}" if _tensor_path_reports_errors() else PONG)
     else:
         _agree(f"unknown action {action!r}")
+
+
+# ---------------------------------------------------------------- receive (tcp)
+
+
+def _connect(address: str) -> None:
+    """Receive the trainer's packages from ``address`` into a local spool
+    shared by this engine's TP ranks (one connection per engine, from a
+    receiver process started by TP rank 0); installs then find them there.
+
+    The spool is created in the temporary directory (``TMPDIR``).
+    """
+    if _RECEIVER["address"] == address:
+        return
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    group = _tp_group()
+    spool = [None]
+    if getattr(group, "rank_in_group", 0) == 0:
+        if _RECEIVER["process"] is not None:
+            _RECEIVER["process"].terminate()
+            _RECEIVER["process"].wait()
+            shutil.rmtree(_STATE["epoch_dir"], ignore_errors=True)
+        spool = [tempfile.mkdtemp(prefix="dws-spool-")]
+        # a package is acknowledged once every TP rank prefetched it
+        # own session: Ray kills an engine's process group, which would leave the spool behind
+        _RECEIVER["process"] = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "relax.utils.delta_tcp",
+                address,
+                spool[0],
+                str(group.world_size),
+                str(os.getpid()),
+            ],
+            start_new_session=True,
+        )
+    if group.world_size > 1:
+        dist.broadcast_object_list(spool, src=group.first_rank, group=group.cpu_group)
+    _RECEIVER["address"] = address
+    _STATE["epoch_dir"] = spool[0]
 
 
 # ---------------------------------------------------------------- install (shared storage)
@@ -108,27 +158,33 @@ def _install(model: torch.nn.Module, meta: dict) -> None:
     """Install a published version package (:mod:`relax.utils.delta_store`) by
     replaying its buckets; every TP rank reads the package itself.
 
-    A full package is followed by a ``reset`` message, as over NCCL.
+    Without ``path`` (tcp transport) the package is the one received into this
+    engine's spool. A full package is followed by a ``reset`` message, as over
+    NCCL.
     """
-    from relax.utils.delta_store import FULL, read_buckets
+    from relax.utils.delta_store import FULL, read_buckets, sealed_package
 
-    error = None
+    error, path = None, meta.get("path")
     if meta["kind"] != FULL and _STATE["epoch"] != meta["epoch"]:
         error = f"epoch mismatch: committed epoch {_STATE['epoch']}, package epoch {meta['epoch']}"
+    elif path is None:
+        path = sealed_package(_STATE["epoch_dir"], meta["version"], meta["kind"]) if _STATE["epoch_dir"] else None
+        if path is None:
+            error = f"{meta['kind']} package of v{meta['version']} was not received"
     _agree(error, on_error=_fail)
-    _STATE["epoch_dir"] = os.path.dirname(meta["path"].rstrip("/"))
+    _STATE["epoch_dir"] = os.path.dirname(path.rstrip("/"))
     device = next(model.parameters()).device
-    prefetched = _take_prefetch(meta["path"])
+    prefetched = _take_prefetch(path)
     if prefetched is not None:
         buckets = (([(n, t.to(device)) for n, t in bucket], sha) for bucket, sha in prefetched)
     else:
-        buckets = ((bucket, None) for bucket in read_buckets(meta["path"], device))
+        buckets = ((bucket, None) for bucket in read_buckets(path, device))
     while True:
         item = None
         try:
             item = next(buckets, None)
         except Exception as exc:  # noqa: BLE001 - unreadable package; reported below
-            error = f"reading {meta['path']}: {type(exc).__name__}: {exc}"
+            error = f"reading {path}: {type(exc).__name__}: {exc}"
         _agree(error, on_error=_fail)
         if item is None:
             break

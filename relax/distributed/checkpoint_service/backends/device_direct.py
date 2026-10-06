@@ -242,17 +242,25 @@ class DeviceDirectBackend(CommBackend):
                 logger.warning(f"--delta-weight-sync disabled: {reason}; rollout updates stay full.")
         # --delta-transport shared_fs: versions travel as packages in a shared directory
         # (relax.utils.delta_store); the NCCL group then only carries the loader ping.
+        # tcp: the same packages, in a directory on the trainer node, streamed to every engine
+        # (relax.utils.delta_tcp; the address goes out with the ping).
         self._store_dir = None
         self._store_epoch = None  # claimed by the PP-src rank of PP stage 0 (global rank 0)
         self._package: Optional[Any] = None  # PackageWriter of the version being sent (rank 0)
         self._versions_since_full_package = 0
-        if self._delta is not None and getattr(args, "delta_transport", "nccl") == "shared_fs":
+        self._tcp_server: Optional[Any] = None  # PackageServer (rank 0, tcp transport)
+        if self._delta is not None and getattr(args, "delta_transport", "nccl") in ("shared_fs", "tcp"):
             self._store_dir = args.delta_store_dir
             if dist.get_rank() == 0:
                 from relax.utils.delta_store import claim_epoch
 
                 self._store_epoch = claim_epoch(self._store_dir)
-                logger.info(f"[delta] shared store {self._store_dir}, epoch {self._store_epoch}")
+                logger.info(f"[delta] package store {self._store_dir}, epoch {self._store_epoch}")
+                if args.delta_transport == "tcp":
+                    from relax.utils.delta_tcp import PackageServer
+
+                    self._tcp_server = PackageServer(ray._private.services.get_node_ip_address(), args.delta_tcp_port)
+                    logger.info(f"[delta] tcp package server at {self._tcp_server.address}")
 
     @staticmethod
     def _rollout_topology_signature_of(rollout_topology: Dict[Any, Dict[str, Any]]) -> frozenset:
@@ -433,6 +441,7 @@ class DeviceDirectBackend(CommBackend):
             )
 
     _PREFETCH_WAIT_S = 10.0  # shared-storage transport: bound on waiting for engines to read a package
+    _TCP_SEND_TIMEOUT_S = 300.0  # tcp transport: bound on sending a package to every engine
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
 
@@ -997,22 +1006,26 @@ class DeviceDirectBackend(CommBackend):
         of them committed it.
         """
         package = self._package
-        meta = {
-            "action": "install",
-            "kind": package.kind,
-            "epoch": package.epoch,
-            "version": package.version,
-            "path": package.seal(),
-        }
+        meta = {"action": "install", "kind": package.kind, "epoch": package.epoch, "version": package.version}
+        path = package.seal()
+        if self._tcp_server is None:
+            meta["path"] = path  # over tcp each engine finds the package in its own spool
         return self._send_control(meta, weight_version)
 
     def _wait_prefetch(self, path: str) -> str:
-        """Give the engines up to ``_PREFETCH_WAIT_S`` to read the sealed
-        package before the pause (global rank 0); returns a log note."""
+        """Before the pause (global rank 0): over tcp, send the sealed package
+        to every engine (each acknowledges it once received and prefetched); on
+        shared storage, give the engines up to ``_PREFETCH_WAIT_S`` to read it.
+
+        Returns a log note.
+        """
+        start = time.monotonic()
+        if self._tcp_server is not None:
+            acked = self._tcp_server.send(path, len(self.rollout_engines), self._TCP_SEND_TIMEOUT_S)
+            return f", sent to {acked}/{len(self.rollout_engines)} engines in {time.monotonic() - start:.2f}s"
         from relax.utils.delta_store import count_ready
 
         expected = len(self.rollout_engines) * self.args.rollout_num_gpus_per_engine
-        start = time.monotonic()
         ready = count_ready(path)
         while ready < expected and time.monotonic() - start < self._PREFETCH_WAIT_S:
             time.sleep(0.02)
@@ -1123,7 +1136,13 @@ class DeviceDirectBackend(CommBackend):
         """
         if self._store_dir is not None:
             # the full version was written to a package instead of being broadcast: install it now
-            error = self._install_package(str(self.weight_version)) if dist.get_rank() == 0 else None
+            error = None
+            if dist.get_rank() == 0:
+                if self._tcp_server is not None:
+                    logger.info(
+                        f"[delta] v{self.weight_version} full package{self._wait_prefetch(self._package.seal())}"
+                    )
+                error = self._install_package(str(self.weight_version))
             if not self._all_ranks_ok(error is None):
                 if dist.get_rank() == 0:
                     self._finish_package(publish=False)
@@ -1170,7 +1189,10 @@ class DeviceDirectBackend(CommBackend):
                 return f"engine {rank} uses dp_size={info.get('dp_size')}"
         # registration alone is not enough: an SGLang without the Relax patch would pass the
         # message to model.load_weights, so require the loader's own reply from every engine
-        ping = [(META_NAME, encode_meta({"action": "ping"}, self.device))]
+        ping_meta = {"action": "ping"}
+        if self._tcp_server is not None:
+            ping_meta["tcp"] = self._tcp_server.address  # engines connect to receive packages
+        ping = [(META_NAME, encode_meta(ping_meta, self.device))]
         errors = self._broadcast_to_loader(ping, None)
         missing = [rank for rank in self.rollout_engines if PONG not in (errors.get(rank) or "")]
         if missing:
