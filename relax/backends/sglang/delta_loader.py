@@ -72,8 +72,8 @@ _STATE: dict = {
 _PREFETCH: dict = {"generation": 0, "path": None, "buckets": None}
 _PREFETCH_LOCK = threading.Lock()
 
-# tcp transport: this engine's receiver process (TP rank 0 only) and the trainer address it receives from
-_RECEIVER: dict = {"address": None, "process": None}
+# tcp transport: pid of this engine's receiver process (TP rank 0 only) and the trainer address it receives from
+_RECEIVER: dict = {"address": None, "pid": None}
 
 
 class MaskedCopyError(RuntimeError):
@@ -119,6 +119,7 @@ def _connect(address: str) -> None:
     if _RECEIVER["address"] == address:
         return
     import shutil
+    import signal
     import subprocess
     import sys
     import tempfile
@@ -126,25 +127,27 @@ def _connect(address: str) -> None:
     group = _tp_group()
     spool = [None]
     if getattr(group, "rank_in_group", 0) == 0:
-        if _RECEIVER["process"] is not None:
-            _RECEIVER["process"].terminate()
-            _RECEIVER["process"].wait()
+        if _RECEIVER["pid"] is not None:
+            os.kill(_RECEIVER["pid"], signal.SIGTERM)
             shutil.rmtree(_STATE["epoch_dir"], ignore_errors=True)
         spool = [tempfile.mkdtemp(prefix="dws-spool-")]
-        # a package is acknowledged once every TP rank prefetched it
-        # own session: Ray kills an engine's process group, which would leave the spool behind
-        _RECEIVER["process"] = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "relax.utils.delta_tcp",
-                address,
-                spool[0],
-                str(group.world_size),
-                str(os.getpid()),
-            ],
-            start_new_session=True,
+        # a package is acknowledged once every TP rank prefetched it.
+        # Started through a short-lived intermediate process in its own session, so the receiver is neither a
+        # child of the scheduler (SGLang's kill_process_tree) nor in its process group (Ray): it outlives a
+        # killed engine just long enough to remove the spool.
+        receiver = [sys.executable, "-m", "relax.utils.delta_tcp", address, spool[0], str(group.world_size)]
+        # the receiver must not hold the pipe the pid is read from (its output goes to the engine's stderr)
+        launcher = (
+            "import subprocess, sys; "
+            "print(subprocess.Popen(sys.argv[1:], stdout=sys.stderr, start_new_session=True).pid)"
         )
+        out = subprocess.run(
+            [sys.executable, "-c", launcher, *receiver, str(os.getpid())],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        _RECEIVER["pid"] = int(out.stdout)
     if group.world_size > 1:
         dist.broadcast_object_list(spool, src=group.first_rank, group=group.cpu_group)
     _RECEIVER["address"] = address

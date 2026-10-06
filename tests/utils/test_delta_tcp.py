@@ -5,6 +5,7 @@ use by the SGLang delta loader."""
 
 import json
 import os
+import signal
 import socket
 import tempfile
 import threading
@@ -29,11 +30,13 @@ from tests.utils.test_delta_store import full_buckets, perturb, sealed_delta, st
 @pytest.fixture(autouse=True)
 def close_receiver():
     yield
-    process = delta_loader._RECEIVER["process"]
-    if process is not None:
-        process.terminate()
-        process.wait()
-    delta_loader._RECEIVER.update(address=None, process=None)
+    pid = delta_loader._RECEIVER["pid"]
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    delta_loader._RECEIVER.update(address=None, pid=None)
 
 
 def sealed(tmp_path, version, sizes):

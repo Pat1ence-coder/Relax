@@ -293,13 +293,16 @@ def main(argv=None) -> None:
     """``python -m relax.utils.delta_tcp ADDRESS SPOOL READY_COUNT
     PARENT_PID``: run a receiver in its own process (the SGLang scheduler loop
     would starve a receiver thread of the GIL); it exits, removing the spool,
-    when its parent is gone."""
+    when process ``PARENT_PID`` is gone."""
     import sys
 
     address, spool, ready_count, parent = argv or sys.argv[1:]
-    parent = int(parent)  # passed in: the parent may already be gone once the imports above finish
     PackageReceiver(address, spool, int(ready_count))
-    while os.getppid() == parent:
+    while True:
+        try:
+            os.kill(int(parent), 0)
+        except ProcessLookupError:
+            break
         time.sleep(1.0)
     shutil.rmtree(spool, ignore_errors=True)
 
