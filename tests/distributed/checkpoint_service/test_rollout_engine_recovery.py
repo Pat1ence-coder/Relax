@@ -150,8 +150,8 @@ def test_pause_rollout_dead_engine_rebuilds_group_and_pauses_survivors(monkeypat
     backend._rollout_topology_signature = "SIG"
 
     def batch_request(endpoint, payload=None, get_rank=False):
-        pauses.append(sorted(backend.rollout_engines))
-        if 1 in backend.rollout_engines:
+        pauses.append((endpoint, sorted(backend.rollout_engines)))
+        if endpoint == "/pause_generation" and 1 in backend.rollout_engines:
             raise ConnectionError("engine 1: connection refused")
         return []
 
@@ -165,7 +165,8 @@ def test_pause_rollout_dead_engine_rebuilds_group_and_pauses_survivors(monkeypat
     monkeypatch.setattr(device_direct.ray, "get", lambda x: x)
     backend._pause_rollout()
     assert rebuilds == [(None, ["0", "1"])]  # rebuild path forced, from the current topology
-    assert pauses == [[0, 1], [0]]
+    # the engines that paused are resumed before the rebuild's (generating) health check
+    assert pauses == [("/pause_generation", [0, 1]), ("/continue_generation", [0, 1]), ("/pause_generation", [0])]
     assert flushed == [0] and backend._rollout_paused
 
 
@@ -175,7 +176,9 @@ def test_pause_rollout_raises_when_rebuild_finds_no_engine(monkeypatch):
     backend.rollout_engines = {0: object()}
     backend.rollout_topology = {"0": {"rank": 0}}
 
-    def batch_request(*_a, **_k):
+    def batch_request(endpoint, *_a, **_k):
+        if endpoint == "/continue_generation":
+            return []
         raise ConnectionError("connection refused")
 
     def rebuild(_topology_data):

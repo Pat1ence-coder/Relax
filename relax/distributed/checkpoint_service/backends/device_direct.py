@@ -1150,6 +1150,12 @@ class DeviceDirectBackend(CommBackend):
             ray.get(self._batch_request("/pause_generation"))
         except Exception as e:  # noqa: BLE001 - re-raised below if no engine is left
             logger.warning(f"Pausing generation failed ({e}); rebuilding the rollout weight-update group")
+            # the engines that did pause would fail the health check (it generates): resume them first
+            for future in self._batch_request("/continue_generation"):
+                try:
+                    ray.get(future)
+                except Exception:  # noqa: BLE001 - the dead engine; pruned by the rebuild
+                    pass
             self._rollout_topology_signature = None  # force the rebuild path
             self.init_process_group_for_rollout({"nodes": {"rollout": dict(self.rollout_topology)}})
             ray.get(self._batch_request("/pause_generation"))
