@@ -792,14 +792,7 @@ class DeviceDirectBackend(CommBackend):
 
         if not actor_fwd_only:
             if dist.get_rank() == 0 and not self._rollout_paused:
-                # Pause generation on all rollout nodes
-                logger.info("Pausing generation on all rollout nodes...")
-                ray.get(self._batch_request("/pause_generation"))
-
-                # Flush cache on all rollout nodes
-                logger.info("Flushing cache on all rollout nodes...")
-                for rank, engine in self.rollout_engines.items():
-                    ray.get(engine.flush_cache.remote())
+                self._pause_rollout()
             self._rollout_paused = False
 
             dist.barrier(group=get_gloo_group())
@@ -1141,11 +1134,25 @@ class DeviceDirectBackend(CommBackend):
         dist.barrier(group=get_gloo_group())
 
     def _pause_rollout(self) -> None:
-        """Pause generation and flush caches on every engine (PP-src rank)."""
+        """Pause generation and flush caches on every engine (PP-src rank).
+
+        An engine can die after this update's health check (in
+        ``init_process_group_for_rollout``). Failing the update would escalate
+        to a global restart, which ``_update_rollout_engines`` avoids for the
+        same failure: so rebuild the weight-update group the way a failed
+        health check does (unhealthy engines are pruned) and pause the
+        remaining engines.
+        """
         if self._rollout_paused:
             return
         logger.info("Pausing generation on all rollout nodes...")
-        ray.get(self._batch_request("/pause_generation"))
+        try:
+            ray.get(self._batch_request("/pause_generation"))
+        except Exception as e:  # noqa: BLE001 - re-raised below if no engine is left
+            logger.warning(f"Pausing generation failed ({e}); rebuilding the rollout weight-update group")
+            self._rollout_topology_signature = None  # force the rebuild path
+            self.init_process_group_for_rollout({"nodes": {"rollout": dict(self.rollout_topology)}})
+            ray.get(self._batch_request("/pause_generation"))
         self._rollout_paused = True
         for engine in self.rollout_engines.values():
             ray.get(engine.flush_cache.remote())

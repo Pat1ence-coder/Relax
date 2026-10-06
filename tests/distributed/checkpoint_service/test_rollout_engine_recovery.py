@@ -132,3 +132,58 @@ def test_topology_signature_distinguishes_pruned_from_full():
     sig_full = DeviceDirectBackend._rollout_topology_signature_of(full)
     sig_pruned = DeviceDirectBackend._rollout_topology_signature_of(pruned)
     assert sig_full != sig_pruned
+
+
+class _Engine:
+    def __init__(self, flushed: list, rank: int):
+        self.flush_cache = type("M", (), {"remote": staticmethod(lambda: flushed.append(rank))})()
+
+
+def test_pause_rollout_dead_engine_rebuilds_group_and_pauses_survivors(monkeypatch):
+    # An engine dies after the update's health check: the pause must not fail the update
+    # (global restart) but rebuild the group over the healthy engines and pause those.
+    flushed, pauses, rebuilds = [], [], []
+    backend = object.__new__(DeviceDirectBackend)
+    backend._rollout_paused = False
+    backend.rollout_engines = {0: _Engine(flushed, 0), 1: _Engine(flushed, 1)}
+    backend.rollout_topology = {"0": {"rank": 0}, "1": {"rank": 1}}
+    backend._rollout_topology_signature = "SIG"
+
+    def batch_request(endpoint, payload=None, get_rank=False):
+        pauses.append(sorted(backend.rollout_engines))
+        if 1 in backend.rollout_engines:
+            raise ConnectionError("engine 1: connection refused")
+        return []
+
+    def rebuild(topology_data):
+        rebuilds.append((backend._rollout_topology_signature, sorted(topology_data["nodes"]["rollout"])))
+        backend.rollout_engines.pop(1)  # pruned by the health check in the rebuild path
+        backend.rollout_topology.pop("1")
+
+    backend._batch_request = batch_request
+    backend.init_process_group_for_rollout = rebuild
+    monkeypatch.setattr(device_direct.ray, "get", lambda x: x)
+    backend._pause_rollout()
+    assert rebuilds == [(None, ["0", "1"])]  # rebuild path forced, from the current topology
+    assert pauses == [[0, 1], [0]]
+    assert flushed == [0] and backend._rollout_paused
+
+
+def test_pause_rollout_raises_when_rebuild_finds_no_engine(monkeypatch):
+    backend = object.__new__(DeviceDirectBackend)
+    backend._rollout_paused = False
+    backend.rollout_engines = {0: object()}
+    backend.rollout_topology = {"0": {"rank": 0}}
+
+    def batch_request(*_a, **_k):
+        raise ConnectionError("connection refused")
+
+    def rebuild(_topology_data):
+        raise RuntimeError("No healthy rollout engines available after 30 retries")
+
+    backend._batch_request = batch_request
+    backend.init_process_group_for_rollout = rebuild
+    monkeypatch.setattr(device_direct.ray, "get", lambda x: x)
+    with pytest.raises(RuntimeError, match="No healthy rollout engines"):
+        backend._pause_rollout()
+    assert not backend._rollout_paused
