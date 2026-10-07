@@ -151,6 +151,7 @@ class SparseDeltaSync:
         self.total_bytes = 0
         self._snapshot: dict[str, torch.Tensor] = {}
         self._pending: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        self._pending_ready: torch.cuda.Event | None = None  # completion of the pending D2H copy
 
         tp_rank = mpu.get_tensor_model_parallel_rank()
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
@@ -191,18 +192,21 @@ class SparseDeltaSync:
         dist.all_reduce(total, group=get_gloo_group())
         self.total_bytes = int(total.item())
         self.committed_version = version
-        self._pending = []
+        self._pending, self._pending_ready = [], None
         # self-check: the first delta after every seed is re-sent in full and compared
         self.verify_next = True
         self.deltas_since_verify = 0
 
     def drop(self) -> None:
         self._snapshot.clear()
-        self._pending = []
+        self._pending, self._pending_ready = [], None
         self.committed_version = None
 
     def commit(self, version: int) -> None:
         """Advance the snapshot by the delta all engines acknowledged."""
+        if self._pending_ready is not None:
+            self._pending_ready.synchronize()  # the batched D2H started by compute_local
+            self._pending_ready = None
         for name, pos, values in self._pending:
             self._snapshot[name].view(-1)[pos] = values
         self._pending = []
@@ -212,7 +216,7 @@ class SparseDeltaSync:
     def discard(self) -> None:
         """Forget a delta the engines did not commit; the snapshot stays at the
         committed version."""
-        self._pending = []
+        self._pending, self._pending_ready = [], None
 
     def verified(self) -> None:
         self.verify_next = False
@@ -230,6 +234,7 @@ class SparseDeltaSync:
         self.converter.init_tasks()
         entries = []
         pending = []
+        nan_flags = []  # checked once after the loop instead of one host sync per parameter
         for name, param in self._contributed_params():
             live = param.data
             snap = self._snapshot.get(name)
@@ -243,8 +248,8 @@ class SparseDeltaSync:
             if not live.is_floating_point():
                 raise DeltaUnavailable(f"non-floating parameter {name} changed")
             values = live.reshape(-1)[pos]
-            if bool(torch.isnan(values).any()):
-                raise DeltaUnavailable(f"NaN among the changed values of {name}")
+            # a NaN value would read as "unchanged" in the probe; such a version is rejected below
+            nan_flags.append(torch.isnan(values).any())
             probe = torch.full_like(live, float("nan"))
             probe.view(-1)[pos] = values
             probe = torch.nn.Parameter(probe, requires_grad=False)
@@ -261,8 +266,13 @@ class SparseDeltaSync:
                 idx = (~torch.isnan(flat)).nonzero().view(-1)
                 if idx.numel():
                     entries.append((hf_name, list(hf_tensor.shape), flat.dtype, idx.to(torch.int32), flat[idx]))
-            pending.append((name, pos.cpu(), values.cpu()))
-        self._pending = pending
+            pending.append((name, pos, values))
+        if nan_flags:
+            flags = torch.stack(nan_flags)
+            if bool(flags.any()):
+                bad = [name for (name, _, _), flag in zip(pending, flags.tolist()) if flag]
+                raise DeltaUnavailable(f"NaN among the changed values of {bad[:3]}")
+        self._pending, self._pending_ready = _to_host(pending)
         return entries
 
     # ------------------------------------------------------------ gather + pack
@@ -368,6 +378,32 @@ class SparseDeltaSync:
                 val = torch.zeros(1, dtype=torch.uint8, device=self.device)
             buckets.append([(META_NAME, encode_meta(meta, self.device)), (IDX_NAME, idx), (VAL_NAME, val)])
         return buckets
+
+
+def _to_host(pending: list) -> tuple[list, torch.cuda.Event | None]:
+    """Copy the per-parameter ``(name, pos, values)`` to pinned host memory
+    with one asynchronous D2H per tensor kind instead of two blocking copies
+    per parameter.
+
+    Returns host views (valid once the event completed) and the event.
+    """
+    if not pending or not pending[0][1].is_cuda:
+        return [(n, p.cpu(), v.cpu()) for n, p, v in pending], None
+    pos = torch.cat([p for _, p, _ in pending])
+    raw = _concat_aligned([v for _, _, v in pending])  # aligned so each piece can be viewed back as its dtype
+    pos_host = torch.empty(pos.shape, dtype=pos.dtype, pin_memory=True)
+    raw_host = torch.empty(raw.shape, dtype=raw.dtype, pin_memory=True)
+    pos_host.copy_(pos, non_blocking=True)
+    raw_host.copy_(raw, non_blocking=True)
+    ready = torch.cuda.Event()
+    ready.record()
+    out, p0, v0 = [], 0, 0
+    for name, p, v in pending:
+        nbytes = v.numel() * v.element_size()
+        out.append((name, pos_host[p0 : p0 + p.numel()], raw_host[v0 : v0 + nbytes].view(v.dtype)))
+        p0 += p.numel()
+        v0 += align(nbytes)
+    return out, ready
 
 
 def _dtype(name: str) -> torch.dtype:
