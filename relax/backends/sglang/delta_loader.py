@@ -2,9 +2,9 @@
 
 """SGLang ``custom_weight_loader`` that installs sparse weight deltas in place.
 
-Registered on the engine as ``relax.utils.delta_wire.LOADER_PATH`` and reached
+Registered on the engine as ``relax.distributed.weight_sync.wire.LOADER_PATH`` and reached
 through ``/update_weights_from_distributed(load_format=...)`` (see the Relax
-SGLang patch). Message layout is described in :mod:`relax.utils.delta_wire`.
+SGLang patch). Message layout is described in :mod:`relax.distributed.weight_sync.wire`.
 
 The rollout keeps no weight snapshot. For each sparse entry a full-shape tensor
 holding the new values at changed positions and NaN elsewhere is handed to the
@@ -30,12 +30,13 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
-from relax.utils.delta_wire import (
+from relax.distributed.weight_sync.wire import (
     DTYPES,
     ERROR_TAG,
     IDX_NAME,
     META_NAME,
     PONG,
+    STATE_REPLY,
     TENSOR_PATH_SAFE,
     UNSUPPORTED,
     VAL_NAME,
@@ -102,6 +103,9 @@ def load_weights(model: torch.nn.Module, named_tensors) -> None:
             _connect(meta["tcp"])
         # the trainer expects this exact failure to prove the message reached this loader
         _agree(f"{PONG} {TENSOR_PATH_SAFE}" if _tensor_path_reports_errors() else PONG)
+    elif action == "state":
+        # read-only query (engine-side installer); answered as a failure like ping, never a weight change
+        _agree(_state_reply())
     else:
         _agree(f"unknown action {action!r}")
 
@@ -135,7 +139,14 @@ def _connect(address: str) -> None:
         # Started through a short-lived intermediate process in its own session, so the receiver is neither a
         # child of the scheduler (SGLang's kill_process_tree) nor in its process group (Ray): it outlives a
         # killed engine just long enough to remove the spool.
-        receiver = [sys.executable, "-m", "relax.utils.delta_tcp", address, spool[0], str(group.world_size)]
+        receiver = [
+            sys.executable,
+            "-m",
+            "relax.distributed.weight_sync.tcp",
+            address,
+            spool[0],
+            str(group.world_size),
+        ]
         # the receiver must not hold the pipe the pid is read from (its output goes to the engine's stderr)
         launcher = (
             "import subprocess, sys; "
@@ -158,14 +169,16 @@ def _connect(address: str) -> None:
 
 
 def _install(model: torch.nn.Module, meta: dict) -> None:
-    """Install a published version package (:mod:`relax.utils.delta_store`) by
-    replaying its buckets; every TP rank reads the package itself.
+    """Install a published version package
+    (:mod:`relax.distributed.weight_sync.store`) by replaying its buckets;
+    every TP rank reads the package itself.
 
     Without ``path`` (tcp transport) the package is the one received into this
     engine's spool. A full package is followed by a ``reset`` message, as over
-    NCCL.
+    NCCL. ``verify`` (full package only): compare the live weights with it
+    while loading; the following ``reset`` reports any mismatch.
     """
-    from relax.utils.delta_store import FULL, read_buckets, sealed_package
+    from relax.distributed.weight_sync.store import FULL, read_buckets, sealed_package
 
     error, path = None, meta.get("path")
     if meta["kind"] != FULL and _STATE["epoch"] != meta["epoch"]:
@@ -193,6 +206,8 @@ def _install(model: torch.nn.Module, meta: dict) -> None:
             break
         bucket, sha = item
         bucket_meta, rest = decode_meta(bucket[0][1]), bucket[1:]
+        if meta.get("verify") and bucket_meta["action"] == "full":
+            bucket_meta["verify"] = True
         if bucket_meta["action"] == "delta":
             _delta(model, bucket_meta, dict(rest), sha)
         else:
@@ -220,7 +235,7 @@ def _start_prefetch(version: int) -> None:
 
 
 def _prefetch(epoch_dir: str, version: int, generation: int) -> None:
-    from relax.utils.delta_store import DELTA, mark_ready, read_buckets, read_manifest, sealed_package
+    from relax.distributed.weight_sync.store import DELTA, mark_ready, read_buckets, read_manifest, sealed_package
 
     deadline = time.monotonic() + PREFETCH_GIVE_UP_S
     path = None
@@ -514,6 +529,15 @@ def _unsupported(model: torch.nn.Module) -> list[str]:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _state_reply() -> str:
+    """``STATE_REPLY`` followed by the committed state as JSON (same on every
+    TP rank after a successful step)."""
+    import json
+
+    state = {k: _STATE[k] for k in ("epoch", "version", "must_full", "error")}
+    return f"{STATE_REPLY}{json.dumps(state, separators=(',', ':'))}"
 
 
 def _fail(error: str) -> None:

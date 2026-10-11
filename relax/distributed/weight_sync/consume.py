@@ -1,16 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Consume a shared-storage delta store without the trainer.
+"""Consume a delta store without the trainer.
 
 Brings a weight version (default: the latest) out of a ``--delta-store-dir``
-written by ``--delta-transport shared_fs``, starting from a full package and
-replaying the deltas after it (:func:`relax.utils.delta_store.plan`)::
+written by ``--delta-transport shared_fs`` (or served over TCP), starting from a
+full package and replaying the deltas after it
+(:func:`relax.distributed.weight_sync.store.plan`)::
 
     # rebuild the HF weights on CPU
-    python -m relax.tools.delta_consume --store-dir D --output OUT_DIR
-    # install into a running SGLang engine started with
+    python -m relax.distributed.weight_sync.consume --store-dir D --output OUT_DIR
+    # bring a running SGLang engine started with
     #   --custom-weight-loader relax.backends.sglang.delta_loader.load_weights
-    python -m relax.tools.delta_consume --store-dir D --engine-url http://host:port --tp 2
+    # from the version it holds to the latest one (WeightInstaller)
+    python -m relax.distributed.weight_sync.consume --store-dir D --engine-url http://host:port --tp 2
+    python -m relax.distributed.weight_sync.consume --tcp HOST:PORT --spool DIR --engine-url http://host:port
 
 ``--to EPOCH:VERSION`` selects another version. Only reads the store.
 """
@@ -20,22 +23,12 @@ import json
 import os
 import sys
 
-import requests
 import torch
 from safetensors.torch import save_file
 
-from relax.utils.delta_store import FULL, plan, read_buckets
-from relax.utils.delta_wire import (
-    DTYPES,
-    IDX_NAME,
-    LOADER_PATH,
-    META_NAME,
-    VAL_NAME,
-    decode_meta,
-    encode_meta,
-    encode_named_cpu_tensors,
-    payload_sha256,
-)
+from relax.distributed.weight_sync.installer import HttpEngine, SharedStoreSource, TcpSource, WeightInstaller
+from relax.distributed.weight_sync.store import plan, read_buckets
+from relax.distributed.weight_sync.wire import DTYPES, IDX_NAME, VAL_NAME, decode_meta, payload_sha256
 from relax.utils.logging_utils import get_logger
 
 
@@ -90,49 +83,55 @@ def write_safetensors(weights: dict[str, torch.Tensor], out_dir: str) -> None:
         json.dump({"metadata": {}, "weight_map": index}, f, indent=1)
 
 
-def install(packages, engine_url: str, tp: int) -> None:
-    """Install ``packages`` into a running engine through the delta loader."""
-
-    def send(meta: dict, weight_version: str | None) -> None:
-        payload = {
-            "serialized_named_tensors": [encode_named_cpu_tensors([(META_NAME, encode_meta(meta, "cpu"))])] * tp,
-            "load_format": LOADER_PATH,
-            "flush_cache": True,
-        }
-        if weight_version is not None:
-            payload["weight_version"] = weight_version
-        response = requests.post(f"{engine_url.rstrip('/')}/update_weights_from_tensor", json=payload)
-        if response.status_code != 200:
-            raise RuntimeError(f"{meta['action']} {meta.get('path', '')}: {response.text[:2000]}")
-
-    for package in packages:
-        meta = {"action": "install", "kind": package.kind, "epoch": package.epoch, "version": package.version}
-        send(dict(meta, path=package.path), str(package.version))
-        if package.kind == FULL:
-            send({"action": "reset", "version": package.version, "epoch": package.epoch}, None)
-        logger.info(f"installed {os.path.basename(package.path)}")
+def install(engine_url: str, tp: int, source, target=None, verify: bool = False) -> int:
+    """Bring a running engine from whatever version it holds to ``target``
+    through the delta loader (:class:`WeightInstaller`)."""
+    installer = WeightInstaller(HttpEngine(engine_url, tp, timeout=None), source)
+    result = installer.install(target, verify=verify)
+    for path in result.installed:
+        logger.info(f"installed {os.path.basename(path)}")
+    if result.abandoned:
+        logger.warning("the engine held a version of an abandoned run; reinstalled from a full package")
+    if not result.ok:
+        print(f"install failed: {result.error}" + (" (engine left paused)" if result.paused else ""), file=sys.stderr)
+        return 1
+    logger.info(f"engine at e{result.state.epoch}:v{result.state.version}" + (", verified" if result.verified else ""))
+    return 0
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--store-dir", required=True)
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--store-dir", help="read packages from this store")
+    src.add_argument("--tcp", help="fetch packages from this package server (HOST:PORT; --engine-url only)")
+    parser.add_argument("--spool", help="with --tcp: local directory for fetched packages")
     parser.add_argument("--to", help="EPOCH:VERSION (default: the latest version in the store)")
     out = parser.add_mutually_exclusive_group(required=True)
     out.add_argument("--output", help="write the rebuilt HF weights as safetensors into this new directory")
     out.add_argument("--engine-url", help="install into this SGLang engine")
     parser.add_argument("--tp", type=int, default=1, help="tensor parallel size of --engine-url")
+    parser.add_argument(
+        "--verify", action="store_true", help="with --engine-url: check bitwise against a full package"
+    )
     args = parser.parse_args(argv)
 
     target = tuple(int(x) for x in args.to.split(":")) if args.to else None
+    if args.engine_url:
+        if args.tcp:
+            if not args.spool:
+                parser.error("--tcp needs --spool")
+            source = TcpSource(args.tcp, args.spool)
+        else:
+            source = SharedStoreSource(args.store_dir)
+        return install(args.engine_url, args.tp, source, target, args.verify)
+    if args.tcp:
+        parser.error("--output reads a --store-dir")
     packages = plan(args.store_dir, target=target)
     if not packages:
         print(f"no packages in {args.store_dir}", file=sys.stderr)
         return 1
     logger.info("plan: " + ", ".join(os.path.relpath(p.path, args.store_dir) for p in packages))
-    if args.output:
-        write_safetensors(rebuild(packages), args.output)
-    else:
-        install(packages, args.engine_url, args.tp)
+    write_safetensors(rebuild(packages), args.output)
     return 0
 
 

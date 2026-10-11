@@ -1,11 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""TCP transport for version packages (:mod:`relax.utils.delta_store`).
+"""TCP transport for version packages
+(:mod:`relax.distributed.weight_sync.store`).
 
-The trainer (global rank 0) runs a :class:`PackageServer`; every rollout engine
-runs one :class:`PackageReceiver`, which keeps one connection to it and writes
-each package into a local spool directory laid out like the store, so the
-SGLang delta loader installs (and prefetches) it like a shared-storage package.
+Two ways to use a :class:`PackageServer`:
+
+- push (the in-job sync): the trainer (global rank 0) offers each sealed
+  package with :meth:`PackageServer.send`; every rollout engine runs one
+  :class:`PackageReceiver`, which keeps one connection to it and writes each
+  package into a local spool directory laid out like the store, so the SGLang
+  delta loader installs (and prefetches) it like a shared-storage package.
+- pull: a server given ``store_dir`` also answers :class:`PackageFetcher`
+  clients, which list the store (``HEAD``, published packages, epoch records)
+  and fetch any published package by its path. The server then only reads
+  the store and knows nothing about its consumers, so it can also run as a
+  process of its own (``python -m relax.distributed.weight_sync.tcp serve``)
+  that keeps serving while the trainer restarts.
 
 Frames are a ``!4sBI`` header (magic, type, payload length) and a payload:
 JSON for control frames, ``!IQ`` (file index, offset) plus raw bytes for DATA.
@@ -18,7 +28,8 @@ JSON for control frames, ``!IQ`` (file index, offset) plus raw bytes for DATA.
 - reconnect: the receiver reconnects with backoff and reports in HELLO the
   package it was receiving and the bytes it holds per file; the server resumes
   from there, or counts the package as acknowledged when it was complete. A
-  package with another name supersedes a partial one.
+  package with another name supersedes a partial one. A fetcher re-requests
+  the package with the bytes it holds per file.
 
 Plain TCP without authentication: for trusted internal networks only.
 """
@@ -32,7 +43,7 @@ import threading
 import time
 import uuid
 
-from relax.utils.delta_store import DELTA, MANIFEST, count_ready, read_manifest
+from relax.distributed.weight_sync.store import DELTA, MANIFEST, Listing, Package, count_ready, listing, read_manifest
 from relax.utils.logging_utils import get_logger
 
 
@@ -41,10 +52,11 @@ logger = get_logger(__name__)
 MAGIC = b"DWS1"
 HEADER = struct.Struct("!4sBI")
 DATA_HEADER = struct.Struct("!IQ")
-HELLO, PACKAGE, DATA, CREDIT, ACK = range(1, 6)
+HELLO, PACKAGE, DATA, CREDIT, ACK, REQUEST, LISTING = range(1, 8)
 CHUNK_BYTES = 4 << 20
 WINDOW_BYTES = 64 << 20
 READY_WAIT_S = 10.0  # receiver: how long to wait for the engine's prefetch before acknowledging a delta
+FETCH_RETRIES = 8  # fetcher: reconnects per request before giving up
 
 
 def send_frame(sock: socket.socket, kind: int, *parts: bytes) -> None:
@@ -75,12 +87,23 @@ def recv_frame(sock: socket.socket) -> tuple[int, bytearray]:
     return kind, _recv_exact(sock, n)
 
 
+def _within(root: str, rel: str) -> str:
+    """``root/rel``, refusing paths that leave ``root``."""
+    root = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([root, path]) != root or path == root:
+        raise ValueError(f"path {rel!r} is outside {root}")
+    return path
+
+
 class PackageServer:
     """Sends the package of the running :meth:`send` to every connected
-    receiver."""
+    receiver, and (with ``store_dir``) any published package of ``store_dir``
+    to the fetchers that request it."""
 
-    def __init__(self, host: str, port: int = 0, chunk_bytes: int = CHUNK_BYTES):
+    def __init__(self, host: str, port: int = 0, chunk_bytes: int = CHUNK_BYTES, store_dir: str | None = None):
         self.chunk_bytes = chunk_bytes
+        self.store_dir = store_dir
         self._sock = socket.create_server((host, port))  # held while the server lives: no port race
         self.address = f"{host}:{self._sock.getsockname()[1]}"
         self._cond = threading.Condition()
@@ -125,6 +148,9 @@ class PackageServer:
             raise ConnectionError(f"expected HELLO, got frame type {kind}")
         held = json.loads(payload)  # receiver id, window, and the package it holds (name, sizes, done)
         receiver, credit = held["id"], held["window"]
+        if held.get("pull"):
+            self._serve_fetcher(conn, credit)
+            return
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: self._path is not None and receiver not in self._acks)
@@ -149,15 +175,60 @@ class PackageServer:
                     self._ack(receiver, gen)
                     break
 
+    def _serve_fetcher(self, conn: socket.socket, credit: int) -> None:
+        """Answer REQUEST frames: ``{"op": "list"}`` with a LISTING, ``{"op":
+
+        "get", "path", "sizes"}`` with the package at ``path`` (relative to the
+        store) from ``sizes`` bytes per file, until its ACK.
+        """
+        while True:
+            kind, payload = recv_frame(conn)
+            if kind == CREDIT:  # left over from the previous package
+                credit += json.loads(payload)["bytes"]
+                continue
+            if kind != REQUEST:
+                raise ConnectionError(f"expected REQUEST, got frame type {kind}")
+            request = json.loads(payload)
+            if self.store_dir is None:
+                send_json(conn, LISTING, {"error": "this server has no store"})
+                continue
+            if request.get("op") == "list":
+                found = listing(self.store_dir)
+                send_json(
+                    conn,
+                    LISTING,
+                    {
+                        "head": found.head,
+                        "packages": [p.to_json(self.store_dir) for p in found.packages],
+                        "epochs": {str(e): info for e, info in found.epochs.items()},
+                    },
+                )
+                continue
+            try:
+                path = _within(self.store_dir, request["path"])
+                manifest = read_manifest(path)
+            except (OSError, ValueError, KeyError) as e:
+                send_json(conn, PACKAGE, {"error": f"{type(e).__name__}: {e}"})
+                continue
+            offsets = request.get("sizes") or [0] * len(manifest["files"])
+            send_json(conn, PACKAGE, {"name": os.path.basename(path), "manifest": manifest})
+            credit, _ = self._send_files(conn, path, manifest["files"], offsets, credit, None)
+            while True:
+                kind, payload = recv_frame(conn)
+                if kind == CREDIT:
+                    credit += json.loads(payload)["bytes"]
+                elif kind == ACK:
+                    break
+
     def _send_files(self, conn, path, files, offsets, credit, gen) -> tuple[int, bool]:
         """DATA frames of ``files`` from ``offsets``; returns the remaining
         credit and whether everything was sent (False: the package stopped
-        being offered)."""
+        being offered; ``gen`` None: a fetched package, never withdrawn)."""
         for i, (entry, offset) in enumerate(zip(files, offsets)):
             with open(os.path.join(path, entry["name"]), "rb") as f:
                 f.seek(offset)
                 while offset < entry["bytes"]:
-                    if self._gen != gen:
+                    if gen is not None and self._gen != gen:
                         return credit, False
                     chunk = f.read(min(self.chunk_bytes, entry["bytes"] - offset))
                     while credit < len(chunk):
@@ -178,7 +249,7 @@ class PackageReceiver:
     ``spool`` (kept to the latest package).
 
     A delta package is acknowledged once complete and ``ready_count`` consumers
-    marked it read (:func:`relax.utils.delta_store.mark_ready`), bounded by
+    marked it read (:func:`relax.distributed.weight_sync.store.mark_ready`), bounded by
     ``READY_WAIT_S``.
     """
 
@@ -292,14 +363,154 @@ class PackageReceiver:
         send_json(sock, ACK, {"name": self._name})
 
 
+class PackageFetcher:
+    """Client of a :class:`PackageServer` with a store: lists it and fetches
+    published packages into a local directory laid out like the store.
+
+    Each request reconnects (with backoff, at most ``retries`` times) when the
+    connection drops; a fetch resumes from the bytes already on disk.
+    """
+
+    def __init__(self, address: str, window: int = WINDOW_BYTES, retries: int = FETCH_RETRIES):
+        host, port = address.rsplit(":", 1)
+        self.address, self.window, self.retries = address, window, retries
+        self._target = (host, int(port))
+        self._sock: socket.socket | None = None
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def listing(self) -> Listing:
+        reply = self._request(lambda sock: self._list(sock))
+        return Listing(
+            reply["head"],
+            [Package.from_json(p) for p in reply["packages"]],
+            {int(e): info for e, info in reply["epochs"].items()},
+        )
+
+    def fetch(self, rel: str, dest: str) -> str:
+        """Bring the package at ``rel`` (relative to the store) to
+        ``dest/rel``; returns that path.
+
+        A package already complete there is not fetched again.
+        """
+        path = _within(dest, rel)
+        if os.path.exists(os.path.join(path, MANIFEST)):
+            return path
+        os.makedirs(path, exist_ok=True)
+        self._request(lambda sock: self._get(sock, rel, path))
+        return path
+
+    def _connection(self) -> socket.socket:
+        if self._sock is None:
+            sock = socket.create_connection(self._target)
+            send_json(sock, HELLO, {"id": uuid.uuid4().hex, "window": self.window, "pull": True})
+            self._sock = sock
+        return self._sock
+
+    def _request(self, call):
+        delay = 0.1
+        for attempt in range(self.retries + 1):
+            try:
+                return call(self._connection())
+            except FileNotFoundError:  # answered by the server: not a transport error
+                raise
+            except OSError as e:
+                self.close()
+                if attempt == self.retries:
+                    raise
+                logger.info(f"[delta] tcp connection to {self.address} lost ({e}); retrying in {delay:.1f}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 5.0)
+
+    def _list(self, sock: socket.socket) -> dict:
+        send_json(sock, REQUEST, {"op": "list"})
+        kind, payload = recv_frame(sock)
+        reply = json.loads(payload)
+        if kind != LISTING or "error" in reply:
+            raise FileNotFoundError(f"{self.address}: {reply.get('error', f'frame type {kind}')}")
+        return reply
+
+    def _get(self, sock: socket.socket, rel: str, path: str) -> None:
+        files = sorted(n for n in os.listdir(path) if not n.startswith("."))
+        sizes = None
+        manifest_cache = os.path.join(path, f".{MANIFEST}.partial")
+        if os.path.exists(manifest_cache):  # resuming: report what is on disk
+            with open(manifest_cache) as f:
+                cached = json.load(f)["files"]
+            sizes = [os.path.getsize(os.path.join(path, e["name"])) if e["name"] in files else 0 for e in cached]
+        send_json(sock, REQUEST, {"op": "get", "path": rel, "sizes": sizes})
+        kind, payload = recv_frame(sock)
+        message = json.loads(payload)
+        if kind != PACKAGE or "error" in message:
+            raise FileNotFoundError(f"{self.address}: {rel}: {message.get('error', f'frame type {kind}')}")
+        manifest = message["manifest"]
+        with open(manifest_cache, "w") as f:
+            json.dump(manifest, f)
+        entries = manifest["files"]
+        remaining = sum(e["bytes"] for e in entries) - sum(sizes or [0])
+        out = None
+        try:
+            while remaining > 0:
+                kind, payload = recv_frame(sock)
+                if kind != DATA:
+                    raise ConnectionError(f"expected DATA, got frame type {kind}")
+                i, offset = DATA_HEADER.unpack_from(payload)
+                if out is None or out[0] != i:
+                    if out is not None:
+                        out[1].close()
+                    out = (i, open(os.path.join(path, entries[i]["name"]), "ab"))
+                f = out[1]
+                if f.tell() != offset:
+                    raise ConnectionError(f"file {i}: data at offset {offset}, have {f.tell()} bytes")
+                f.write(memoryview(payload)[DATA_HEADER.size :])
+                f.flush()
+                n = len(payload) - DATA_HEADER.size
+                remaining -= n
+                send_json(sock, CREDIT, {"bytes": n})
+        finally:
+            if out is not None:
+                out[1].close()
+        os.rename(manifest_cache, os.path.join(path, MANIFEST))  # complete: the package is now readable
+        send_json(sock, ACK, {"name": os.path.basename(path)})
+
+
+def serve(argv=None) -> None:
+    """``python -m relax.distributed.weight_sync.tcp serve --store-dir D.
+
+    [--host H] [--port P]``: serve the published packages of a store to
+    fetchers, independently of the trainer that writes it.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="relax.distributed.weight_sync.tcp serve")
+    parser.add_argument("--store-dir", required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=0)
+    args = parser.parse_args(argv)
+    server = PackageServer(args.host, args.port, store_dir=args.store_dir)
+    logger.info(f"[delta] serving {args.store_dir} at {server.address} (plain TCP: trusted networks only)")
+    while True:
+        time.sleep(3600)
+
+
 def main(argv=None) -> None:
-    """``python -m relax.utils.delta_tcp ADDRESS SPOOL READY_COUNT
+    """``python -m relax.distributed.weight_sync.tcp ADDRESS SPOOL READY_COUNT
     PARENT_PID``: run a receiver in its own process (the SGLang scheduler loop
     would starve a receiver thread of the GIL); it exits, removing the spool,
-    when process ``PARENT_PID`` is gone."""
+    when process ``PARENT_PID`` is gone.
+
+    ``... serve ...``: see :func:`serve`.
+    """
     import sys
 
-    address, spool, ready_count, parent = argv or sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "serve":
+        serve(argv[1:])
+        return
+    address, spool, ready_count, parent = argv
     PackageReceiver(address, spool, int(ready_count))
     while True:
         try:

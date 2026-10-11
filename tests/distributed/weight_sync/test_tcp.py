@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU tests for the TCP package transport (``relax.utils.delta_tcp``) and its
-use by the SGLang delta loader."""
+"""CPU tests for the TCP package transport
+(``relax.distributed.weight_sync.tcp``) and its use by the SGLang delta
+loader."""
 
 import json
 import os
@@ -17,14 +18,20 @@ import torch
 pytest.importorskip("megatron.core")
 
 from relax.backends.sglang import delta_loader  # noqa: E402
-from relax.utils import delta_store, delta_tcp  # noqa: E402
-from relax.utils.delta_wire import META_NAME, PONG, encode_meta  # noqa: E402
+from relax.distributed.weight_sync import store as delta_store  # noqa: E402
+from relax.distributed.weight_sync import tcp as delta_tcp  # noqa: E402
+from relax.distributed.weight_sync.wire import META_NAME, PONG, encode_meta  # noqa: E402
 from tests.backends.sglang.test_delta_loader import (  # noqa: E402,F401
     FakeModel,
     assert_bitwise,
     fresh_loader,
 )
-from tests.utils.test_delta_store import full_buckets, perturb, sealed_delta, stop_prefetch  # noqa: E402,F401
+from tests.distributed.weight_sync.test_store import (  # noqa: E402,F401
+    full_buckets,
+    perturb,
+    sealed_delta,
+    stop_prefetch,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -189,3 +196,102 @@ def test_delta_loader_installs_packages_received_over_tcp(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="was not received"):
         install(delta_store.DELTA, 3)
     assert delta_loader._STATE["must_full"]
+
+
+def test_delta_tcp_fetcher_lists_the_store_and_fetches_published_packages(tmp_path):
+    """Pull mode: a server over a store answers listings and serves any
+    published package, resuming a fetch cut mid-way from the bytes on disk."""
+    store, dest = tmp_path / "store", tmp_path / "dest"
+    epoch = delta_store.claim_epoch(str(store), resumed_from=None)
+    w = delta_store.PackageWriter(str(store), epoch, 1, delta_store.FULL)
+    for n in (2500, 1200):
+        w.add_bucket([("x", torch.randint(0, 255, (n,), dtype=torch.uint8))])
+    published = w.publish()
+    server = delta_tcp.PackageServer("127.0.0.1", chunk_bytes=1000, store_dir=str(store))
+    fetcher = delta_tcp.PackageFetcher(server.address, window=3000)
+    try:
+        found = fetcher.listing()
+        assert found.head_key == (epoch, 1) and found.epochs[epoch]["resumed_from"] is None
+        (package,) = found.packages
+        assert not os.path.isabs(package.path) and package.nbytes == w.nbytes
+
+        # cut the connection after the first DATA frame: the retry resumes from what is on disk
+        real_get, calls = fetcher._get, []
+
+        def flaky_get(sock, rel, path):
+            calls.append(1)
+            if len(calls) == 1:
+                real_recv = delta_tcp.recv_frame
+
+                def recv_once(s):
+                    frame = real_recv(s)
+                    if frame[0] == delta_tcp.DATA:
+                        delta_tcp.recv_frame = real_recv
+                        f = open(
+                            os.path.join(path, delta_store.read_manifest(published.path)["files"][0]["name"]), "ab"
+                        )
+                        f.write(memoryview(frame[1])[delta_tcp.DATA_HEADER.size :])
+                        f.close()
+                        raise ConnectionError("dropped")
+                    return frame
+
+                delta_tcp.recv_frame = recv_once
+                try:
+                    return real_get(sock, rel, path)
+                finally:
+                    delta_tcp.recv_frame = real_recv
+            return real_get(sock, rel, path)
+
+        fetcher._get = flaky_get
+        path = fetcher.fetch(package.path, str(dest))
+        assert len(calls) == 2
+        assert same_files(published.path, path)
+        assert fetcher.fetch(package.path, str(dest)) == path  # complete: not fetched again
+        with pytest.raises(FileNotFoundError):
+            fetcher.fetch("e000001/v000009.delta", str(dest))
+        with pytest.raises(ValueError):
+            fetcher.fetch("../outside", str(dest))
+    finally:
+        fetcher.close()
+
+
+def test_delta_tcp_serve_entry_point_runs_without_a_trainer(tmp_path):
+    """``python -m relax.distributed.weight_sync.tcp serve`` serves a store on
+    its own."""
+    import subprocess
+    import sys
+    import time
+
+    store = tmp_path / "store"
+    epoch = delta_store.claim_epoch(str(store))
+    w = delta_store.PackageWriter(str(store), epoch, 1, delta_store.FULL)
+    w.add_bucket([("x", torch.ones(10))])
+    w.publish()
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "relax.distributed.weight_sync.tcp",
+            "serve",
+            "--store-dir",
+            str(store),
+            "--port",
+            str(port),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                found = delta_tcp.PackageFetcher(f"127.0.0.1:{port}", retries=0).listing()
+                break
+            except OSError:
+                assert time.monotonic() < deadline and proc.poll() is None, "server did not start"
+                time.sleep(0.2)
+        assert found.head_key == (epoch, 1)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)

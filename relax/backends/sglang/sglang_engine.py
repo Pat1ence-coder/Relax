@@ -31,10 +31,10 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.distributed.weight_sync.wire import LOADER_PATH as DELTA_LOADER_PATH
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
-from relax.utils.delta_wire import LOADER_PATH as DELTA_LOADER_PATH
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger

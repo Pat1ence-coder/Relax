@@ -11,7 +11,7 @@ all-gather replaced by a local stub (own shard + NaN for the other ranks) and
 every other collective forbidden. Non-NaN outputs are exactly this rank's
 changed HF elements, provided the conversion only rearranges elements (checked
 by the probe differential tests). The per-rank entries are merged on global
-rank 0 and packed into buckets in the :mod:`relax.utils.delta_wire` format.
+rank 0 and packed into buckets in the :mod:`relax.distributed.weight_sync.wire` format.
 
 Contributors (each element is reported by exactly one rank):
 experts by expert-data-parallel rank 0, TP-sharded params by data-parallel
@@ -28,7 +28,7 @@ import torch.distributed as dist
 from megatron.core import mpu
 
 from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
-from relax.utils.delta_wire import (
+from relax.distributed.weight_sync.wire import (
     IDX_NAME,
     META_NAME,
     VAL_NAME,

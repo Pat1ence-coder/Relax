@@ -1029,7 +1029,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "With --delta-weight-sync: how versions reach the rollout engines. 'nccl' broadcasts them over "
                     "the weight-update group; 'shared_fs' publishes each version as a package under "
                     "--delta-store-dir, which every engine reads, and which can be consumed offline "
-                    "(python -m relax.tools.delta_consume); 'tcp' writes the same packages to --delta-store-dir "
+                    "(python -m relax.distributed.weight_sync.consume); 'tcp' writes the same packages to --delta-store-dir "
                     "on the trainer node and streams them to every engine over one plain (unauthenticated) TCP "
                     "connection per engine, for trusted internal networks."
                 ),

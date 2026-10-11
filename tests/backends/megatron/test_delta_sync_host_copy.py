@@ -11,7 +11,7 @@ pytest.importorskip("megatron.core")
 
 from relax.backends.megatron.weight_update import delta_sync  # noqa: E402
 from relax.backends.megatron.weight_update.delta_sync import SparseDeltaSync  # noqa: E402
-from relax.utils.delta_wire import int_view  # noqa: E402
+from relax.distributed.weight_sync.wire import int_view  # noqa: E402
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

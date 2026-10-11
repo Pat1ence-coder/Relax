@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU tests for shared-storage version packages (``relax.utils.delta_store``),
-their installation through the SGLang delta loader and the offline consumer."""
+"""CPU tests for shared-storage version packages
+(``relax.distributed.weight_sync.store``), their installation through the
+SGLang delta loader and the offline consumer."""
 
 import json
 import os
@@ -14,9 +15,9 @@ import torch
 pytest.importorskip("megatron.core")
 
 from relax.backends.sglang import delta_loader  # noqa: E402
-from relax.tools import delta_consume  # noqa: E402
-from relax.utils import delta_store  # noqa: E402
-from relax.utils.delta_wire import META_NAME, encode_meta, int_view  # noqa: E402
+from relax.distributed.weight_sync import consume as delta_consume  # noqa: E402
+from relax.distributed.weight_sync import store as delta_store  # noqa: E402
+from relax.distributed.weight_sync.wire import META_NAME, encode_meta, int_view  # noqa: E402
 from tests.backends.sglang.test_delta_loader import (  # noqa: E402,F401
     FakeModel,
     assert_bitwise,
@@ -71,20 +72,69 @@ def history(store, n_versions, seed_state):
 def test_delta_store_publish_is_atomic_and_never_overwrites(tmp_path):
     epoch = delta_store.claim_epoch(str(tmp_path))
     assert epoch == 1 and delta_store.claim_epoch(str(tmp_path)) == 2
-    w = delta_store.PackageWriter(str(tmp_path), 1, 1, delta_store.FULL)
+    w = delta_store.PackageWriter(str(tmp_path), 2, 1, delta_store.FULL)
     w.add_bucket([("x", torch.ones(3))])
     assert delta_store.list_packages(str(tmp_path)) == []  # not visible before publish
     package = w.publish()
-    assert [p.key for p in delta_store.list_packages(str(tmp_path))] == [(1, 1)]
+    assert [p.key for p in delta_store.list_packages(str(tmp_path))] == [(2, 1)]
     head = json.load(open(tmp_path / delta_store.HEAD))
-    assert head == {"epoch": 1, "version": 1, "kind": "full", "path": os.path.relpath(package.path, tmp_path)}
-    again = delta_store.PackageWriter(str(tmp_path), 1, 1, delta_store.FULL)
+    assert head == {"epoch": 2, "version": 1, "kind": "full", "path": os.path.relpath(package.path, tmp_path)}
+    again = delta_store.PackageWriter(str(tmp_path), 2, 1, delta_store.FULL)
     again.add_bucket([("x", torch.zeros(3))])
     with pytest.raises(OSError):
         again.publish()
     again.abort()
     (bucket,) = delta_store.read_buckets(package.path)
     assert torch.equal(dict(bucket)["x"], torch.ones(3))
+
+
+def test_delta_store_publish_is_refused_once_a_newer_epoch_is_claimed(tmp_path):
+    """A trainer that outlived its replacement cannot move HEAD back."""
+    old = delta_store.claim_epoch(str(tmp_path))
+    write(tmp_path, old, 1, delta_store.FULL, [[("x", torch.ones(3))]])
+    stale = delta_store.PackageWriter(str(tmp_path), old, 2, delta_store.FULL)
+    stale.add_bucket([("x", torch.zeros(3))])
+    new = delta_store.claim_epoch(str(tmp_path))
+    with pytest.raises(delta_store.StaleEpochError):
+        stale.publish()
+    assert not os.path.exists(stale.tmp)  # dropped
+    assert delta_store.read_head(str(tmp_path))["epoch"] == old
+    write(tmp_path, new, 1, delta_store.FULL, [[("x", torch.ones(3))]])
+    assert delta_store.read_head(str(tmp_path))["epoch"] == new
+
+
+def test_delta_store_epoch_records_resume_point_and_lineage(tmp_path):
+    """e2 resumed from e1:v3 (a checkpoint): e1:v1..v3 are its ancestors,
+    e1:v4..v5 were abandoned."""
+    e1, _ = history(tmp_path, 5, FakeModel().hf_state())
+    e2 = delta_store.claim_epoch(str(tmp_path), resumed_from=(e1, 3))
+    info = delta_store.read_epoch_info(str(tmp_path), e2)
+    assert info["epoch"] == e2 and info["resumed_from"] == [e1, 3]
+    assert delta_store.read_epoch_info(str(tmp_path), e1)["resumed_from"] is None
+    write(tmp_path, e2, 4, delta_store.FULL, [[("w", torch.zeros(1))]])
+    found = delta_store.listing(str(tmp_path))
+    assert found.head_key == (e2, 4)
+    assert [found.on_head_lineage((e1, v)) for v in range(1, 6)] == [True, True, True, False, False]
+    assert found.on_head_lineage((e2, 4)) and not found.on_head_lineage((e2, 5))
+    assert found.on_lineage((e1, 5), (e1, 5)) and not found.on_lineage((e2, 4), (e1, 5))
+    # epoch records do not show up as packages, and a pruned epoch directory goes with its record
+    assert all(p.path.endswith((".full", ".delta")) for p in found.packages)
+    write(tmp_path, e2, 5, delta_store.FULL, [[("w", torch.zeros(1))]])
+    delta_store.prune(str(tmp_path), e2)
+    assert not os.path.exists(tmp_path / f"e{e1:06d}")
+
+
+def test_delta_store_prune_grace_keeps_packages_just_out_of_retention(tmp_path, monkeypatch):
+    epoch, _ = history(tmp_path, 3, FakeModel().hf_state())
+    write(tmp_path, epoch, 3, delta_store.FULL, [[("w", torch.zeros(1))]])
+    write(tmp_path, epoch, 4, delta_store.FULL, [[("w", torch.zeros(1))]])  # v1..v3 deltas now out of retention
+    before = [(p.version, p.kind) for p in delta_store.list_packages(str(tmp_path))]
+    assert delta_store.prune(str(tmp_path), epoch, grace_s=600) == []
+    assert [(p.version, p.kind) for p in delta_store.list_packages(str(tmp_path))] == before
+    now = time.time()
+    monkeypatch.setattr(delta_store.time, "time", lambda: now + 601)
+    assert delta_store.prune(str(tmp_path), epoch, grace_s=600)
+    assert [(p.version, p.kind) for p in delta_store.list_packages(str(tmp_path))] == [(3, "full"), (4, "full")]
 
 
 def test_delta_store_read_rejects_truncated_bucket(tmp_path):

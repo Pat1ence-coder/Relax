@@ -15,7 +15,6 @@ Features:
 
 import asyncio
 import logging
-import os
 import re
 import socket
 import time
@@ -37,7 +36,7 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
-from relax.utils.delta_wire import (
+from relax.distributed.weight_sync.wire import (
     LOADER_PATH,
     META_NAME,
     PONG,
@@ -241,12 +240,14 @@ class DeviceDirectBackend(CommBackend):
             else:
                 logger.warning(f"--delta-weight-sync disabled: {reason}; rollout updates stay full.")
         # --delta-transport shared_fs: versions travel as packages in a shared directory
-        # (relax.utils.delta_store); the NCCL group then only carries the loader ping.
+        # (relax.distributed.weight_sync.store); the NCCL group then only carries the loader ping.
         # tcp: the same packages, in a directory on the trainer node, streamed to every engine
-        # (relax.utils.delta_tcp; the address goes out with the ping).
+        # (relax.distributed.weight_sync.tcp; the address goes out with the ping).
+        # Packages are written and published by a WeightPublisher, which holds no engine handle;
+        # this backend only installs them on its engines.
         self._store_dir = None
         self._store_epoch = None  # claimed by the PP-src rank of PP stage 0 (global rank 0)
-        self._package: Optional[Any] = None  # PackageWriter of the version being sent (rank 0)
+        self._publisher: Optional[Any] = None  # WeightPublisher (rank 0)
         self._versions_since_full_package = 0
         self._tcp_server: Optional[Any] = None  # PackageServer (rank 0, tcp transport)
         # bytes the current rollout sync sent, per link (see update_weights_for_rollout)
@@ -254,14 +255,14 @@ class DeviceDirectBackend(CommBackend):
         if self._delta is not None and getattr(args, "delta_transport", "nccl") in ("shared_fs", "tcp"):
             self._store_dir = args.delta_store_dir
             if dist.get_rank() == 0:
-                from relax.utils.delta_store import claim_epoch
+                from relax.distributed.weight_sync.publisher import WeightPublisher
 
-                self._store_epoch = claim_epoch(self._store_dir)
+                tcp_host = ray._private.services.get_node_ip_address() if args.delta_transport == "tcp" else None
+                self._publisher = WeightPublisher(self._store_dir, tcp_host, args.delta_tcp_port)
+                self._store_epoch = self._publisher.epoch
+                self._tcp_server = self._publisher.tcp_server
                 logger.info(f"[delta] package store {self._store_dir}, epoch {self._store_epoch}")
-                if args.delta_transport == "tcp":
-                    from relax.utils.delta_tcp import PackageServer
-
-                    self._tcp_server = PackageServer(ray._private.services.get_node_ip_address(), args.delta_tcp_port)
+                if self._tcp_server is not None:
                     logger.info(f"[delta] tcp package server at {self._tcp_server.address}")
 
     @staticmethod
@@ -442,8 +443,6 @@ class DeviceDirectBackend(CommBackend):
                 f"Proceeding with {len(self.rollout_engines)} healthy rollout engine(s) after pruning {final_failed}"
             )
 
-    _PREFETCH_WAIT_S = 10.0  # shared-storage transport: bound on waiting for engines to read a package
-    _TCP_SEND_TIMEOUT_S = 300.0  # tcp transport: bound on sending a package to every engine
     _MASTER_PORT_MIN = 11000
     _MASTER_PORT_MAX = 11999
 
@@ -980,9 +979,9 @@ class DeviceDirectBackend(CommBackend):
                     package = self._new_package("delta", version, base)
                     for tensors in buckets:
                         package.add_bucket(tensors)
-                    prefetch_note = self._wait_prefetch(package.seal())
+                    prefetch_note = self._wait_prefetch()
                     self._pause_rollout()
-                    error = self._install_package(str(version))
+                    error = self._install_package(str(version)) or self._superseded_error()
                 else:
                     self._pause_rollout()
                     for b, tensors in enumerate(buckets):
@@ -1012,12 +1011,14 @@ class DeviceDirectBackend(CommBackend):
 
     # ------------------------------------------------------------ shared-storage transport
 
+    @property
+    def _package(self):
+        """PackageWriter of the version being sent (global rank 0), or None."""
+        return self._publisher.writing if self._publisher is not None else None
+
     def _new_package(self, kind: str, version: int, base: int | None = None):
         """Start the package of ``version`` (global rank 0)."""
-        from relax.utils.delta_store import PackageWriter
-
-        self._package = PackageWriter(self._store_dir, self._store_epoch, version, kind, base)
-        return self._package
+        return self._publisher.begin(kind, version, base)
 
     def _install_package(self, weight_version: str | None) -> str | None:
         """Ask every engine to install the package being written (global rank
@@ -1026,33 +1027,29 @@ class DeviceDirectBackend(CommBackend):
         Engines read it from its temporary path; it is published only once all
         of them committed it.
         """
-        package = self._package
-        meta = {"action": "install", "kind": package.kind, "epoch": package.epoch, "version": package.version}
-        path = package.seal()
-        if self._tcp_server is None:
-            meta["path"] = path  # over tcp each engine finds the package in its own spool
-            self._sent["distribution"] += package.nbytes * self._rollout_receivers()  # every TP rank reads it
+        meta = self._publisher.install_meta()
+        if self._tcp_server is None:  # over tcp each engine finds the package in its own spool
+            self._sent["distribution"] += self._package.nbytes * self._rollout_receivers()  # every TP rank reads it
         return self._send_control(meta, weight_version)
 
-    def _wait_prefetch(self, path: str) -> str:
-        """Before the pause (global rank 0): over tcp, send the sealed package
-        to every engine (each acknowledges it once received and prefetched); on
-        shared storage, give the engines up to ``_PREFETCH_WAIT_S`` to read it.
+    def _wait_prefetch(self) -> str:
+        """Before the pause (global rank 0): let the engines receive or read
+        the package being written, sealed (see ``WeightPublisher.offer``).
 
         Returns a log note.
         """
-        start = time.monotonic()
-        if self._tcp_server is not None:
-            acked = self._tcp_server.send(path, len(self.rollout_engines), self._TCP_SEND_TIMEOUT_S)
-            return f", sent to {acked}/{len(self.rollout_engines)} engines in {time.monotonic() - start:.2f}s"
-        from relax.utils.delta_store import count_ready
+        return self._publisher.offer(len(self.rollout_engines), self._rollout_receivers())
 
-        expected = self._rollout_receivers()
-        ready = count_ready(path)
-        while ready < expected and time.monotonic() - start < self._PREFETCH_WAIT_S:
-            time.sleep(0.02)
-            ready = count_ready(path)
-        return f", prefetched {ready}/{expected} in {time.monotonic() - start:.2f}s"
+    def _superseded_error(self) -> str | None:
+        """Global rank 0: an error when a newer trainer claimed the store, so
+        that every rank fails the sync together instead of only rank 0 at
+        publish."""
+        from relax.distributed.weight_sync.store import latest_epoch
+
+        newest = latest_epoch(self._store_dir)
+        if newest != self._store_epoch:
+            return f"store {self._store_dir} was taken over by epoch {newest} (this trainer: {self._store_epoch})"
+        return None
 
     def _send_control(self, meta: dict, weight_version: str | None) -> str | None:
         """Send a metadata-only loader message (global rank 0): over
@@ -1079,23 +1076,23 @@ class DeviceDirectBackend(CommBackend):
 
     def _finish_package(self, publish: bool) -> None:
         """Publish (or drop) the package being written and prune the store
-        (global rank 0)."""
-        package, self._package = self._package, None
+        (global rank 0).
+
+        A publish refused because a newer trainer took over the store is only
+        logged here (other ranks may already be past their last collective);
+        the next sync fails on every rank (``_superseded_error``).
+        """
+        from relax.distributed.weight_sync.store import StaleEpochError
+
+        package = self._package
         if package is None:
             return
         if self._tcp_server is None:
             self._sent["store_write"] += package.nbytes  # over tcp the store is on the trainer node
-        if not publish:
-            package.abort()
-            return
-        from relax.utils.delta_store import prune
-
-        published = package.publish()
-        removed = prune(self._store_dir, self._store_epoch)
-        logger.info(
-            f"[delta] published {os.path.relpath(published.path, self._store_dir)} ({package.nbytes} B)"
-            + (f", pruned {len(removed)}" if removed else "")
-        )
+        try:
+            self._publisher.finish(publish)
+        except StaleEpochError as e:
+            logger.error(f"[delta] not published: {e}")
 
     def _write_anchor_package(self) -> None:
         """Every ``--delta-anchor-interval`` versions, export the current
@@ -1183,10 +1180,8 @@ class DeviceDirectBackend(CommBackend):
             error = None
             if dist.get_rank() == 0:
                 if self._tcp_server is not None:
-                    logger.info(
-                        f"[delta] v{self.weight_version} full package{self._wait_prefetch(self._package.seal())}"
-                    )
-                error = self._install_package(str(self.weight_version))
+                    logger.info(f"[delta] v{self.weight_version} full package{self._wait_prefetch()}")
+                error = self._install_package(str(self.weight_version)) or self._superseded_error()
             if not self._all_ranks_ok(error is None):
                 if dist.get_rank() == 0:
                     self._finish_package(publish=False)

@@ -37,6 +37,8 @@ VERIFY_MISMATCH = "verify_mismatch"
 PONG = "delta loader pong"
 # appended to PONG when /update_weights_from_tensor reports loader errors instead of crashing
 TENSOR_PATH_SAFE = "tensor-path-safe"
+# prefix of the loader's reply to a state message, followed by JSON {epoch, version, must_full, error}
+STATE_REPLY = "delta loader state "
 VAL_ALIGN = 8
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 

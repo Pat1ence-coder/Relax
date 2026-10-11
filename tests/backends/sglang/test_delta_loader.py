@@ -18,7 +18,13 @@ pytest.importorskip("megatron.core")
 
 from relax.backends.megatron.weight_update.delta_sync import SparseDeltaSync  # noqa: E402
 from relax.backends.sglang import delta_loader  # noqa: E402
-from relax.utils.delta_wire import META_NAME, VERIFY_MISMATCH, decode_meta, encode_meta, int_view  # noqa: E402
+from relax.distributed.weight_sync.wire import (  # noqa: E402
+    META_NAME,
+    VERIFY_MISMATCH,
+    decode_meta,
+    encode_meta,
+    int_view,
+)
 
 
 class FakeModel(torch.nn.Module):
@@ -257,7 +263,27 @@ def test_delta_pack_empty_delta_still_produces_one_bucket():
 
 
 def test_delta_loader_answers_ping_with_pong():
-    from relax.utils.delta_wire import PONG
+    from relax.distributed.weight_sync.wire import PONG
 
     with pytest.raises(RuntimeError, match=PONG):
         delta_loader.load_weights(FakeModel(), [(META_NAME, encode_meta({"action": "ping"}, "cpu"))])
+
+
+def test_delta_loader_reports_its_state_without_touching_weights():
+    import json
+
+    from relax.distributed.weight_sync.wire import STATE_REPLY
+
+    model = FakeModel()
+    state_msg = [(META_NAME, encode_meta({"action": "state"}, "cpu"))]
+    with pytest.raises(RuntimeError, match=STATE_REPLY) as before:
+        delta_loader.load_weights(model, state_msg)
+    reply = json.loads(str(before.value).split(STATE_REPLY, 1)[1])
+    assert reply["must_full"] and reply["version"] is None
+    state = seed(model, version=3)
+    with pytest.raises(RuntimeError, match=STATE_REPLY) as after:
+        delta_loader.load_weights(model, state_msg)
+    reply = json.loads(str(after.value).split(STATE_REPLY, 1)[1])
+    assert reply == {"epoch": None, "version": 3, "must_full": False, "error": None}
+    assert_bitwise(model, state)
+    assert not delta_loader._STATE["must_full"]  # a query is not a failure
